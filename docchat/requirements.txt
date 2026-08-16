@@ -5,6 +5,8 @@ fastembed          # local embeddings (bge-small, ONNX) — first run downloads 
 pypdf
 python-docx
 httpx
+pyjwt              # Clerk session JWT verification (ragchat/auth.py)
+cryptography       # JWKS key loading for PyJWT (ragchat/auth.py)
 pandas             # spreadsheet analysis
 openpyxl           # .xlsx support for pandas
 matplotlib         # charts (headless Agg backend)
