@@ -47,6 +47,7 @@
   }
 
   a { color: inherit; text-decoration: none; }
+  .hidden { display: none !important; }
 
   .container { max-width: 1200px; margin: 0 auto; padding: 0 32px; }
 
@@ -64,6 +65,21 @@
   .nav-links { display: flex; align-items: center; gap: 28px; }
   .nav-links a { font-size: 14px; font-weight: 500; color: var(--body); transition: color 0.15s; }
   .nav-links a:hover { color: var(--ink); }
+  .nav-auth { color: var(--body); }
+  .nav-auth.btn-secondary { height: 34px; padding: 0 14px; font-size: 13px; }
+  .nav-user { display: inline-flex; align-items: center; gap: 12px; }
+  .nav-profile {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: none; border: none; cursor: pointer; padding: 2px 4px;
+    font-family: var(--sans); font-size: 14px; font-weight: 500; color: var(--ink);
+    border-radius: 8px; transition: background-color 0.15s;
+  }
+  .nav-profile:hover { background: var(--surface-card); }
+  .nav-avatar {
+    width: 28px; height: 28px; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--primary); color: #fff; font-size: 13px; font-weight: 600;
+  }
 
   /* ---------------- buttons ---------------- */
   .btn {
@@ -249,7 +265,10 @@
     .hero-grid { grid-template-columns: 1fr; gap: 40px; }
     .hero h1 { font-size: 32px; letter-spacing: -0.5px; }
     .nav-links { gap: 0; }
-    .nav-links a:not(.btn) { display: none; }
+    .nav-links a:not(.btn):not(.nav-auth) { display: none; }
+    .nav-auth.btn-secondary { padding: 0 10px; }
+    .nav-user { gap: 8px; }
+    #landing-username { display: none; }
     .sec-head h2 { font-size: 32px; }
     .features { grid-template-columns: 1fr; }
     .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -279,6 +298,15 @@
     <nav class="nav-links" aria-label="Primary">
       <a href="#features">Features</a>
       <a href="#pipeline">How it works</a>
+      <a href="#" id="landing-signin" class="nav-auth hidden">Sign in</a>
+      <a href="#" id="landing-signup" class="btn btn-secondary nav-auth hidden">Sign up</a>
+      <span id="landing-user" class="nav-user hidden">
+        <button id="landing-profile" class="nav-profile" title="Manage your profile">
+          <span id="landing-avatar" class="nav-avatar" aria-hidden="true"></span>
+          <span id="landing-username"></span>
+        </button>
+        <a href="#" id="landing-signout" class="nav-auth">Sign out</a>
+      </span>
       <a href="/app" class="btn btn-primary">Try now</a>
     </nav>
   </div>
@@ -295,7 +323,7 @@
         <a href="/app" class="btn btn-primary">Try now</a>
         <a href="#features" class="btn btn-secondary">See what it does</a>
       </div>
-      <p class="hero-note">Free to run · your keys, your data · no account needed</p>
+      <p class="hero-note">Free to run · your keys, your data · demo includes 3 free chats</p>
     </div>
 
     <div class="hero-art" aria-hidden="true">
@@ -465,6 +493,114 @@
     </div>
   </div>
 </footer>
+
+<script>
+/* Landing-page auth: shows Sign in / Sign up when signed out, and a profile
+   chip + Sign out when signed in (the sign-up button disappears once signed
+   in). Same integration pattern as the app
+   (clerk.com/docs/js-frontend/getting-started): UI bundle + clerk-js are
+   loaded from the app's FAPI domain with the publishable-key attribute. */
+(function () {
+  var signin = document.getElementById("landing-signin");
+  var signup = document.getElementById("landing-signup");
+  var userRow = document.getElementById("landing-user");
+  var profileBtn = document.getElementById("landing-profile");
+  var avatar = document.getElementById("landing-avatar");
+  var username = document.getElementById("landing-username");
+  var signout = document.getElementById("landing-signout");
+  if (!signin || !signup || !userRow) return;
+
+  function loadScript(src, attrKey, attrVal) {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      s.src = src;
+      s.async = true;
+      s.crossOrigin = "anonymous";
+      if (attrKey) s.setAttribute(attrKey, attrVal);
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error("Failed to load " + src)); };
+      document.head.appendChild(s);
+    });
+  }
+
+  function initialOf(u) {
+    var name = ((u && (u.firstName || u.username)) || (u && u.emailAddress) || "").trim();
+    return name ? name[0].toUpperCase() : "?";
+  }
+
+  // render nav per auth state: signed out -> Sign in + Sign up;
+  // signed in -> profile chip + Sign out (no sign-up visible)
+  function renderAuth() {
+    var u = window.Clerk && window.Clerk.user;
+    var signedIn = !!u;
+    signin.classList.toggle("hidden", signedIn);
+    signup.classList.toggle("hidden", signedIn);
+    userRow.classList.toggle("hidden", !signedIn);
+    if (signedIn) {
+      avatar.textContent = initialOf(u);
+      username.textContent = u.firstName || u.username ||
+        (u.emailAddress || "").split("@")[0] || "Account";
+    }
+  }
+
+  fetch("/api/state")
+    .then(function (r) { return r.json(); })
+    .then(function (st) {
+      var domain = st.clerk_domain, pk = st.clerk_pk;
+      if (!st.clerk_enabled || !domain || !pk) return; // guest-only mode
+      return (function () {
+        var chain = Promise.resolve();
+        if (!window.__internal_ClerkUICtor) {
+          chain = chain.then(function () {
+            return loadScript("https://" + domain + "/npm/@clerk/ui@1/dist/ui.browser.js");
+          });
+        }
+        if (!window.Clerk) {
+          chain = chain.then(function () {
+            return loadScript(
+              "https://" + domain + "/npm/@clerk/clerk-js@6/dist/clerk.browser.js",
+              "data-clerk-publishable-key", pk);
+          });
+        }
+        return chain.then(function () {
+          return window.Clerk.load({
+            ui: { ClerkUI: window.__internal_ClerkUICtor },
+            signInUrl: "/sign-in",
+            signUpUrl: "/sign-up",
+          });
+        });
+      })();
+    })
+    .then(function () {
+      signin.addEventListener("click", function (e) {
+        e.preventDefault();
+        window.Clerk.openSignIn();
+      });
+      signup.addEventListener("click", function (e) {
+        e.preventDefault();
+        window.Clerk.openSignUp();
+      });
+      profileBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        window.Clerk.openUserProfile();
+      });
+      signout.addEventListener("click", function (e) {
+        e.preventDefault();
+        window.Clerk.signOut();
+      });
+      renderAuth();
+      // live auth-state changes (sign in / sign out anywhere)
+      window.Clerk.addListener(function () { renderAuth(); });
+    })
+    .catch(function (err) {
+      // graceful: hide the auth controls on any failure (guest mode still works)
+      console.warn("Landing auth unavailable:", err);
+      signin.classList.add("hidden");
+      signup.classList.add("hidden");
+      userRow.classList.add("hidden");
+    });
+})();
+</script>
 
 </body>
 </html>

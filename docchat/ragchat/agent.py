@@ -117,6 +117,7 @@ class Agent:
         embed_fn=None,
         get_sheet_path=None,
         is_disconnected=None,
+        uid: str = "",
     ):
         self.key = key
         self.model = model
@@ -126,6 +127,7 @@ class Agent:
         self.embed_fn = embed_fn
         self.get_sheet_path = get_sheet_path or (lambda _sid: None)
         self.is_disconnected = is_disconnected or (lambda: False)
+        self.uid = uid  # identity for chart URLs (fetched via <img>, no headers)
         self._last_sources: list[dict] = []
         self._chart_event: dict | None = None
         self._web_cache: dict[str, str] = {}  # per-turn dedup of web queries
@@ -496,6 +498,9 @@ class Agent:
             # validate the chart renders before promising a URL
             await asyncio.to_thread(spreadsheet.chart, df, chart_type, column, group)
             url = f"/api/sheets/{sid}/chart?type={chart_type}&column={column}&group={group or ''}"
+            if self.uid:
+                # chart is fetched via <img> (no auth headers) -> identity in the URL
+                url += f"&uid={self.uid}"
             self._chart_event = {"type": "chart", "url": url}
             return f"Chart ready: {url}"
         return f"Error: unknown op '{op}' (info|stats|groupby|filter|anomalies|chart)."

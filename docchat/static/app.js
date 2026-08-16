@@ -19,6 +19,7 @@ const state = {
   keySet: false,
   tavilySet: false,
   model: "",
+  demoMaxChats: 0,
   voice: "troy",
   ttsEnabled: localStorage.getItem("jarvis_tts") === "1",
   recording: false,
@@ -37,9 +38,40 @@ function toast(msg, kind = "") {
   setTimeout(() => t.remove(), 4500);
 }
 
-/* ---------------- api + markdown helpers ---------------- */
+/* ---------------- identity + api helpers ---------------- */
+const GUEST_KEY = "jarvis_guest_id";
+
+function guestId() {
+  let g = "";
+  try { g = localStorage.getItem(GUEST_KEY) || ""; } catch (_) {}
+  if (!g) {
+    // crypto.randomUUID where available, else a random fallback (never sent raw)
+    g = (crypto.randomUUID ? crypto.randomUUID() :
+      "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+        const r = Math.random() * 16 | 0;
+        return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+      }));
+    try { localStorage.setItem(GUEST_KEY, g); } catch (_) {}
+  }
+  return g;
+}
+
+// Clerk session token (set after sign-in; null when signed out / not configured)
+let clerkToken = null;
+
+async function authHeaders(extra = {}) {
+  const h = { ...extra };
+  if (clerkToken) {
+    h["Authorization"] = "Bearer " + clerkToken;
+  } else {
+    h["X-Guest-Id"] = guestId();  // guest workspace unless a Clerk session exists
+  }
+  return h;
+}
+
 async function api(url, opts = {}) {
-  const res = await fetch(url, opts);
+  const headers = await authHeaders(opts.headers || {});
+  const res = await fetch(url, { ...opts, headers });
   let data = {};
   try { data = await res.json(); } catch (_) {}
   if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
@@ -233,9 +265,21 @@ function relTime(ts) {
 const PIN_SVG = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M6 1.2l2.3 3.6.7.2v1H3v-1l.7-.2L6 1.2zM4.8 6.5V10M7.2 6.5V10" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/></svg>';
 const EXPORT_SVG = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M6 1.5v5M3.5 4 6 6.5 8.5 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 9.5h8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>';
 
+function renderChatLimit() {
+  const el = $("#chat-limit");
+  if (state.demoMaxChats > 0) {
+    el.classList.remove("hidden");
+    el.textContent = `${state.sessions.length}/${state.demoMaxChats}`;
+    el.classList.toggle("full", state.sessions.length >= state.demoMaxChats);
+  } else {
+    el.classList.add("hidden");
+  }
+}
+
 function renderSessions() {
   const list = $("#sessions-list");
   list.innerHTML = "";
+  renderChatLimit();
   const q = ($("#chat-search").value || "").trim().toLowerCase();
   const sessions = state.sessions.filter((s) => !q || s.title.toLowerCase().includes(q));
   for (const s of sessions) {
@@ -317,7 +361,17 @@ async function loadSessions() {
   renderSessions();
 }
 
+function setDemoChats(n) {
+  state.demoMaxChats = Number.isFinite(n) && n > 0 ? n : 0;
+  renderChatLimit();
+}
+
 function newChat() {
+  // free-demo cap: guests/Clerk users get a limited number of chats
+  if (state.demoMaxChats > 0 && state.sessions.length >= state.demoMaxChats) {
+    toast(`Free demo limited to ${state.demoMaxChats} chats — delete an old chat to start a new one.`, "err");
+    return;
+  }
   state.current = null;
   $("#chat").innerHTML = "";
   emptyEl.classList.remove("hidden");
@@ -469,9 +523,10 @@ async function sendMessage(text) {
   }, REQUEST_TIMEOUT_MS);
 
   try {
+    const headers = await authHeaders({ "Content-Type": "application/json" });
     const res = await fetch("/api/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ session_id: state.current, message: text }),
       signal: state.abort.signal,
     });
@@ -635,9 +690,10 @@ async function speak(text) {
   const clean = cleanForTTS(text);
   if (!clean) return;
   try {
+    const headers = await authHeaders({ "Content-Type": "application/json" });
     const res = await fetch("/api/tts", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ text: clean, voice: state.voice }),
     });
     if (!res.ok) throw new Error((await res.json()).detail || `HTTP ${res.status}`);
@@ -766,6 +822,149 @@ async function saveKey(key) {
   return r;
 }
 
+/* ---------------- identity / account (Clerk + guest) ---------------- */
+const identityBtn = $("#btn-identity");
+const accountBtn = $("#btn-account");
+const identityAvatar = $("#identity-avatar");
+const identityMeta = $("#identity-meta");
+let clerkEnabled = false;
+let clerk = null;
+
+function userInitial(me) {
+  const name = (me.name || me.email || "").trim();
+  return name ? name[0].toUpperCase() : "?";
+}
+
+function setIdentityUI(me, enabled) {
+  clerkEnabled = enabled;
+  if (me.source === "clerk") {
+    // signed-in: avatar initial + name + profile + sign out (sign-up hidden)
+    identityAvatar.classList.remove("hidden");
+    identityAvatar.textContent = userInitial(me);
+    identityMeta.textContent = me.name || me.email || "Signed in";
+    identityMeta.title = me.email || me.name || "";
+    identityBtn.textContent = "Sign out";
+    identityBtn.title = "Sign out";
+    identityBtn.classList.remove("hidden");
+    accountBtn.classList.remove("hidden");
+    accountBtn.title = "Profile — manage your account";
+  } else if (me.source === "guest") {
+    identityAvatar.classList.add("hidden");
+    identityMeta.textContent = "Guest workspace";
+    identityBtn.textContent = "Sign in";
+    identityBtn.title = "Sign in";
+    identityBtn.classList.remove("hidden");
+    accountBtn.classList.add("hidden");
+  } else {
+    identityAvatar.classList.add("hidden");
+    identityMeta.textContent = "Local workspace";
+    identityBtn.textContent = enabled ? "Sign in" : "";
+    identityBtn.classList.toggle("hidden", !enabled);
+    accountBtn.classList.add("hidden");
+  }
+}
+
+async function refreshIdentity() {
+  try {
+    const r = await api("/api/me");
+    setIdentityUI(r.me, !!r.clerk_enabled);
+  } catch (_) {}
+}
+
+async function initClerk() {
+  // Clerk runs client-side via its browser SDK (vanilla JS, no bundler).
+  // Modern script-tag integration (clerk.com/docs/js-frontend/getting-started):
+  //  1. load the UI bundle and clerk-js from the app's FAPI domain,
+  //  2. clerk-js self-initializes with the data-clerk-publishable-key attr,
+  //  3. Clerk.load({ ui }) exposes window.Clerk ready for use.
+  // Gated: when no publishable key is configured the app stays guest/local.
+  const domain = window.__CLERK_DOMAIN__ || "";
+  if (!clerkEnabled || clerk || !domain) return;
+  try {
+    // 1) UI bundle (prebuilt components) from the FAPI domain
+    if (!window.__internal_ClerkUICtor) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = `https://${domain}/npm/@clerk/ui@1/dist/ui.browser.js`;
+        s.async = true;
+        s.crossOrigin = "anonymous";
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("Failed to load Clerk UI bundle"));
+        document.head.appendChild(s);
+      });
+    }
+    // 2) clerk-js from the FAPI domain; the publishable-key attribute
+    //    makes the global Clerk instance self-configure
+    if (!window.Clerk) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = `https://${domain}/npm/@clerk/clerk-js@6/dist/clerk.browser.js`;
+        s.async = true;
+        s.crossOrigin = "anonymous";
+        s.setAttribute("data-clerk-publishable-key", clerkPk());
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("Failed to load Clerk SDK"));
+        document.head.appendChild(s);
+      });
+    }
+    if (!window.Clerk) return;
+    clerk = window.Clerk;
+    await clerk.load({
+      ui: { ClerkUI: window.__internal_ClerkUICtor },
+      // redirect fallback stays on our server (modal is the primary path);
+      // Clerk's hosted pages can 404 for some instances
+      signInUrl: "/sign-in",
+      signUpUrl: "/sign-up",
+    });
+    if (clerk.session) clerkToken = await clerk.session.getToken();
+    refreshIdentity();
+    // keep the token fresh when the session changes (sign in / sign out)
+    clerk.addListener(async (payload) => {
+      clerkToken = payload.session ? await payload.session.getToken() : null;
+      refreshIdentity();
+      // a signed-out user falls back to the guest workspace for this device
+      if (!clerkToken) reloadWorkspace();
+    });
+  } catch (err) {
+    console.warn("Clerk init failed:", err);
+    toast("Clerk sign-in unavailable — using guest workspace.", "err");
+  }
+}
+
+function clerkPk() {
+  // publishable key comes from /api/state (safe: it is public by design)
+  return window.__CLERK_PK__ || "";
+}
+
+async function onIdentityClick() {
+  if (!clerkEnabled) return;
+  if (clerk && clerk.user) {
+    await clerk.signOut();
+    clerkToken = null;
+    reloadWorkspace();
+    return;
+  }
+  try {
+    await initClerk();
+    if (clerk && clerk.openSignIn) clerk.openSignIn();
+  } catch (err) {
+    toast(err.message, "err");
+  }
+}
+
+function reloadWorkspace() {
+  // switch workspace -> refetch everything (docs, chats, memory are per-user)
+  Promise.all([
+    api("/api/state").then((st) => {
+      state.docs = st.docs; state.sessions = st.sessions; state.sheets = st.sheets;
+      setDemoChats(st.demo_max_chats);
+      renderDocs(); renderSheets(); renderSessions(); updateStat();
+    }),
+    loadMemory(),
+    refreshIdentity(),
+  ]).catch(() => {});
+}
+
 /* ---------------- resizable sidebar ---------------- */
 const SIDEBAR_KEY = "jarvis_sidebar_w";
 const SIDEBAR_MIN = 260, SIDEBAR_MAX = 480, SIDEBAR_DEFAULT = 360;
@@ -825,6 +1024,7 @@ async function init() {
   state.tavilySet = !!st.tavily_set;
   state.model = st.model;
   state.voice = st.tts_voice || state.voice;
+  setDemoChats(st.demo_max_chats);
   renderDocs();
   renderSheets();
   renderSessions();
@@ -833,6 +1033,10 @@ async function init() {
   loadMemory().catch(() => {});
   $("#key-banner").classList.toggle("hidden", st.key_set);
   $("#tts-toggle").checked = state.ttsEnabled;
+  if (st.clerk_pk) window.__CLERK_PK__ = st.clerk_pk;
+  if (st.clerk_domain) window.__CLERK_DOMAIN__ = st.clerk_domain;
+  setIdentityUI(st.me || { source: "local" }, !!st.clerk_enabled);
+  if (st.clerk_enabled) initClerk().catch(() => {});
 }
 
 /* ---------------- Groq daily token usage meter ---------------- */
@@ -920,6 +1124,8 @@ $("#sheet-input").addEventListener("change", (e) => {
 // sidebar
 $("#btn-new").addEventListener("click", newChat);
 $("#btn-settings").addEventListener("click", openSettings);
+$("#btn-account").addEventListener("click", () => { if (clerk) clerk.openUserProfile(); });
+$("#btn-identity").addEventListener("click", onIdentityClick);
 $("#btn-key-banner").addEventListener("click", () => { openSettings(); $("#key-input").focus(); });
 $("#btn-close-settings").addEventListener("click", closeSettings);
 $("#btn-refresh-memory").addEventListener("click", () => loadMemory().catch(() => {}));

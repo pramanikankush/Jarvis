@@ -24,6 +24,7 @@ DB_PATH = os.path.join(DATA_DIR, "app.db")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS docs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT '',
     name TEXT NOT NULL,
     size INTEGER NOT NULL,
     chunks INTEGER NOT NULL DEFAULT 0,
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -60,6 +62,7 @@ CREATE TABLE IF NOT EXISTS session_meta (
 );
 CREATE TABLE IF NOT EXISTS memory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT '',
     fact TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'fact',
     session_id TEXT,
@@ -67,6 +70,7 @@ CREATE TABLE IF NOT EXISTS memory (
 );
 CREATE TABLE IF NOT EXISTS sheets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT '',
     name TEXT NOT NULL,
     kind TEXT NOT NULL,
     rows INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +102,12 @@ def fts_query(text: str) -> str:
 
 
 class Store:
+    """SQLite persistence. A single instance is shared across requests; use
+    `for_user(user_id)` to get a per-user scoped view of the same database.
+
+    user_id "" is the legacy/local workspace — existing rows keep working.
+    """
+
     def __init__(self, db_path=DB_PATH):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._lock = threading.Lock()
@@ -106,9 +116,21 @@ class Store:
         self._conn.executescript(SCHEMA)
         self._conn.executescript(FTS_SCHEMA)
         self._migrate()
-        self._version = 0
-        self._cache = None  # (version, rows, matrix)
+        self._uid = ""  # "" = local/legacy workspace (current single-user behaviour)
+        self._shared = {"version": 0, "cache": None}  # (version, uid, rows, matrix)
         self.reindex_fts()  # keeps FTS in sync with pre-existing dbs / crashes
+
+    def for_user(self, user_id: str):
+        """Return a view of this store scoped to one user. Every query is
+        filtered by user_id; rows created through the view carry it. The view
+        shares the connection + lock + search cache so it stays consistent
+        with the base store and other views (multi-user on one DB)."""
+        view = object.__new__(Store)
+        view._lock = self._lock
+        view._conn = self._conn
+        view._uid = user_id or ""
+        view._shared = self._shared
+        return view
 
     def _migrate(self):
         """In-place schema upgrades for databases created before this version.
@@ -118,7 +140,20 @@ class Store:
             cols = [r["name"] for r in self._conn.execute("PRAGMA table_info(sessions)").fetchall()]
             if "pinned" not in cols:
                 self._conn.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
-                self._conn.commit()
+            for table, col in (("docs", "user_id"), ("sessions", "user_id"),
+                               ("memory", "user_id"), ("sheets", "user_id")):
+                tcols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                if col not in tcols:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
+                    )
+            # user_id indexes live here (not in SCHEMA) so old databases get
+            # them only after the column has been added
+            for table in ("docs", "sessions", "memory", "sheets"):
+                self._conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_user ON {table}(user_id)"
+                )
+            self._conn.commit()
         except sqlite3.Error:
             pass
 
@@ -127,8 +162,8 @@ class Store:
         """pages_chunks: [(page, chunk_text)] parallel to embeddings (list of float32 vecs)."""
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO docs(name, size, chunks, uploaded_at) VALUES(?,?,?,?)",
-                (name, size, len(pages_chunks), time.strftime("%Y-%m-%d %H:%M:%S")),
+                "INSERT INTO docs(user_id, name, size, chunks, uploaded_at) VALUES(?,?,?,?,?)",
+                (self._uid, name, size, len(pages_chunks), time.strftime("%Y-%m-%d %H:%M:%S")),
             )
             doc_id = cur.lastrowid
             self._conn.executemany(
@@ -143,25 +178,31 @@ class Store:
                 [(doc_id, name, page, text) for page, text in pages_chunks],
             )
             self._conn.commit()
-            self._version += 1
+            self._shared["version"] += 1
         return self.get_doc(doc_id)
 
     def get_doc(self, doc_id: int) -> dict | None:
-        row = self._conn.execute("SELECT * FROM docs WHERE id=?", (doc_id,)).fetchone()
+        row = self._conn.execute(
+            "SELECT * FROM docs WHERE id=? AND user_id=?", (doc_id, self._uid)
+        ).fetchone()
         return dict(row) if row else None
 
     def list_docs(self) -> list[dict]:
-        rows = self._conn.execute("SELECT * FROM docs ORDER BY uploaded_at DESC").fetchall()
+        rows = self._conn.execute(
+            "SELECT * FROM docs WHERE user_id=? ORDER BY uploaded_at DESC", (self._uid,)
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def delete_doc(self, doc_id: int) -> bool:
         with self._lock:
-            cur = self._conn.execute("DELETE FROM docs WHERE id=?", (doc_id,))
+            cur = self._conn.execute(
+                "DELETE FROM docs WHERE id=? AND user_id=?", (doc_id, self._uid)
+            )
             self._conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
             self._conn.execute("DELETE FROM chunks_fts WHERE doc_id=?", (doc_id,))
             self._conn.commit()
             if cur.rowcount:
-                self._version += 1
+                self._shared["version"] += 1
                 return True
             return False
 
@@ -185,15 +226,18 @@ class Store:
             pass
 
     def keyword_search(self, query: str, k: int = 8) -> list[dict]:
-        """BM25 keyword search over chunks. Returns [] on empty/sanitised query or FTS errors."""
+        """BM25 keyword search over chunks, scoped to this view's user.
+        Returns [] on empty/sanitised query or FTS errors."""
         match = fts_query(query)
         if not match:
             return []
         try:
             rows = self._conn.execute(
-                "SELECT doc_id, doc_name, page, text, bm25(chunks_fts) AS bm25 "
-                "FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25 LIMIT ?",
-                (match, k),
+                "SELECT f.doc_id, f.doc_name, f.page, f.text, bm25(chunks_fts) AS bm25 "
+                "FROM chunks_fts f JOIN docs d ON d.id = f.doc_id "
+                "WHERE chunks_fts MATCH ? AND d.user_id = ? "
+                "ORDER BY bm25 LIMIT ?",
+                (match, self._uid, k),
             ).fetchall()
         except sqlite3.Error:
             return []
@@ -214,20 +258,23 @@ class Store:
         norm = re.sub(r"\s+", " ", fact.strip().lower())
         if not norm:
             return None
-        row = self._conn.execute("SELECT id FROM memory WHERE fact=?", (norm,)).fetchone()
+        row = self._conn.execute(
+            "SELECT id FROM memory WHERE fact=? AND user_id=?", (norm, self._uid)
+        ).fetchone()
         if row:
             return None
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO memory(fact, kind, session_id, created_at) VALUES(?,?,?,?)",
-                (norm, kind, session_id, time.strftime("%Y-%m-%d %H:%M:%S")),
+                "INSERT INTO memory(user_id, fact, kind, session_id, created_at) VALUES(?,?,?,?,?)",
+                (self._uid, norm, kind, session_id, time.strftime("%Y-%m-%d %H:%M:%S")),
             )
             self._conn.commit()
             return {"id": cur.lastrowid, "fact": norm, "kind": kind}
 
     def list_memory(self, limit: int = 200) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT id, fact, kind, created_at FROM memory ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT id, fact, kind, created_at FROM memory WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (self._uid, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -250,33 +297,39 @@ class Store:
             return False
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE memory SET fact=?, kind=COALESCE(?, kind) WHERE id=?",
-                (norm, kind, mid),
+                "UPDATE memory SET fact=?, kind=COALESCE(?, kind) WHERE id=? AND user_id=?",
+                (norm, kind, mid, self._uid),
             )
             self._conn.commit()
             return bool(cur.rowcount)
 
     def delete_memory(self, mid: int) -> bool:
         with self._lock:
-            cur = self._conn.execute("DELETE FROM memory WHERE id=?", (mid,))
+            cur = self._conn.execute(
+                "DELETE FROM memory WHERE id=? AND user_id=?", (mid, self._uid)
+            )
             self._conn.commit()
             return bool(cur.rowcount)
 
     # ---------------- session_meta (summary + current task context) ----------------
     def get_meta(self, sid: str) -> dict:
         row = self._conn.execute(
-            "SELECT summary, task FROM session_meta WHERE session_id=?", (sid,)
+            "SELECT m.summary, m.task FROM session_meta m "
+            "JOIN sessions s ON s.id = m.session_id AND s.user_id = ? "
+            "WHERE m.session_id=?", (self._uid, sid)
         ).fetchone()
         return {"summary": row["summary"] if row else "", "task": row["task"] if row else ""}
 
     def set_meta(self, sid: str, summary: str | None = None, task: str | None = None) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO session_meta(session_id, summary, task, updated_at) VALUES(?,?,?,?) "
+                "INSERT INTO session_meta(session_id, summary, task, updated_at) "
+                "SELECT ?, ?, ?, ? WHERE EXISTS "
+                "(SELECT 1 FROM sessions WHERE id = ? AND user_id = ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET "
                 "summary=COALESCE(?, summary), task=COALESCE(?, task), updated_at=?",
                 (sid, summary or "", task or "", time.strftime("%Y-%m-%d %H:%M:%S"),
-                 summary, task, time.strftime("%Y-%m-%d %H:%M:%S")),
+                 sid, self._uid, summary, task, time.strftime("%Y-%m-%d %H:%M:%S")),
             )
             self._conn.commit()
 
@@ -284,29 +337,38 @@ class Store:
     def add_sheet(self, name: str, kind: str, rows: int, cols: int) -> dict:
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO sheets(name, kind, rows, cols, uploaded_at) VALUES(?,?,?,?,?)",
-                (name, kind, rows, cols, time.strftime("%Y-%m-%d %H:%M:%S")),
+                "INSERT INTO sheets(user_id, name, kind, rows, cols, uploaded_at) VALUES(?,?,?,?,?,?)",
+                (self._uid, name, kind, rows, cols, time.strftime("%Y-%m-%d %H:%M:%S")),
             )
             self._conn.commit()
             sid = cur.lastrowid
         return self.get_sheet(sid)
 
     def get_sheet(self, sid: int) -> dict | None:
-        row = self._conn.execute("SELECT * FROM sheets WHERE id=?", (sid,)).fetchone()
+        row = self._conn.execute(
+            "SELECT * FROM sheets WHERE id=? AND user_id=?", (sid, self._uid)
+        ).fetchone()
         return dict(row) if row else None
 
     def update_sheet_rows(self, sid: int, rows: int, cols: int) -> None:
         with self._lock:
-            self._conn.execute("UPDATE sheets SET rows=?, cols=? WHERE id=?", (rows, cols, sid))
+            self._conn.execute(
+                "UPDATE sheets SET rows=?, cols=? WHERE id=? AND user_id=?",
+                (rows, cols, sid, self._uid),
+            )
             self._conn.commit()
 
     def list_sheets(self) -> list[dict]:
-        rows = self._conn.execute("SELECT * FROM sheets ORDER BY uploaded_at DESC").fetchall()
+        rows = self._conn.execute(
+            "SELECT * FROM sheets WHERE user_id=? ORDER BY uploaded_at DESC", (self._uid,)
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def delete_sheet(self, sid: int) -> bool:
         with self._lock:
-            cur = self._conn.execute("DELETE FROM sheets WHERE id=?", (sid,))
+            cur = self._conn.execute(
+                "DELETE FROM sheets WHERE id=? AND user_id=?", (sid, self._uid)
+            )
             self._conn.commit()
             return bool(cur.rowcount)
 
@@ -316,23 +378,26 @@ class Store:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         with self._lock:
             self._conn.execute(
-                "INSERT INTO sessions(id, title, created_at, updated_at, pinned) VALUES(?,?,?,?,0)",
-                (sid, title, now, now),
+                "INSERT INTO sessions(id, user_id, title, created_at, updated_at, pinned) VALUES(?,?,?,?,?,0)",
+                (sid, self._uid, title, now, now),
             )
             self._conn.commit()
         return {"id": sid, "title": title, "created_at": now, "updated_at": now, "pinned": 0}
 
     def set_title(self, sid: str, title: str):
         with self._lock:
-            self._conn.execute("UPDATE sessions SET title=?, updated_at=? WHERE id=?", (title, time.strftime("%Y-%m-%d %H:%M:%S"), sid))
+            self._conn.execute(
+                "UPDATE sessions SET title=?, updated_at=? WHERE id=? AND user_id=?",
+                (title, time.strftime("%Y-%m-%d %H:%M:%S"), sid, self._uid),
+            )
             self._conn.commit()
 
     def set_pinned(self, sid: str, pinned: bool) -> bool:
         """Pin/unpin a session. Returns False if the session does not exist."""
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE sessions SET pinned=?, updated_at=? WHERE id=?",
-                (1 if pinned else 0, time.strftime("%Y-%m-%d %H:%M:%S"), sid),
+                "UPDATE sessions SET pinned=?, updated_at=? WHERE id=? AND user_id=?",
+                (1 if pinned else 0, time.strftime("%Y-%m-%d %H:%M:%S"), sid, self._uid),
             )
             self._conn.commit()
             return bool(cur.rowcount)
@@ -347,9 +412,9 @@ class Store:
         rows = self._conn.execute(
             "SELECT s.id, s.title, s.updated_at, s.pinned, "
             "(SELECT content FROM messages m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) AS last "
-            "FROM sessions s WHERE s.title LIKE ? COLLATE NOCASE "
+            "FROM sessions s WHERE s.title LIKE ? COLLATE NOCASE AND s.user_id = ? "
             "ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?",
-            (like, limit),
+            (like, self._uid, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -357,8 +422,8 @@ class Store:
         rows = self._conn.execute(
             "SELECT s.id, s.title, s.updated_at, s.pinned, "
             "(SELECT content FROM messages m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) AS last "
-            "FROM sessions s ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?",
-            (limit,),
+            "FROM sessions s WHERE s.user_id = ? ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?",
+            (self._uid, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -378,7 +443,9 @@ class Store:
         }
 
     def get_session(self, sid: str) -> dict | None:
-        row = self._conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+        row = self._conn.execute(
+            "SELECT * FROM sessions WHERE id=? AND user_id=?", (sid, self._uid)
+        ).fetchone()
         return dict(row) if row else None
 
     def add_message(self, sid: str, role: str, content: str, sources: list | None = None) -> None:
@@ -386,6 +453,13 @@ class Store:
 
         with self._lock:
             now = time.strftime("%Y-%m-%d %H:%M:%S")
+            # only write when the session belongs to this user (defence in depth:
+            # a guessed session id must not let another user append messages)
+            ok = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id=? AND user_id=?", (sid, self._uid)
+            ).fetchone()
+            if not ok:
+                return
             self._conn.execute(
                 "INSERT INTO messages(session_id, role, content, sources, created_at) VALUES(?,?,?,?,?)",
                 (sid, role, content, json.dumps(sources or [], ensure_ascii=False), now),
@@ -395,7 +469,9 @@ class Store:
 
     def messages(self, sid: str) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT role, content, sources FROM messages WHERE session_id=? ORDER BY id", (sid,)
+            "SELECT m.role, m.content, m.sources FROM messages m "
+            "JOIN sessions s ON s.id = m.session_id AND s.user_id = ? "
+            "WHERE m.session_id=? ORDER BY m.id", (self._uid, sid)
         ).fetchall()
         out = []
         for r in rows:
@@ -411,7 +487,9 @@ class Store:
 
     def delete_session(self, sid: str) -> bool:
         with self._lock:
-            cur = self._conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+            cur = self._conn.execute(
+                "DELETE FROM sessions WHERE id=? AND user_id=?", (sid, self._uid)
+            )
             self._conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
             self._conn.commit()
             return bool(cur.rowcount)
@@ -424,18 +502,27 @@ class Store:
             pass
 
     def total_chunks(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE d.user_id = ?",
+            (self._uid,),
+        ).fetchone()[0]
 
     def _all(self):
-        """Lazily-cached (chunk_rows, embedding_matrix)."""
-        if self._cache is not None and self._cache[0] == self._version:
-            return self._cache[1], self._cache[2]
-        rows = self._conn.execute("SELECT doc_name, page, text, emb FROM chunks").fetchall()
+        """Lazily-cached (chunk_rows, embedding_matrix), scoped to this view's
+        user and invalidated when the shared version counter changes."""
+        version, cache = self._shared["version"], self._shared["cache"]
+        if cache is not None and cache[0] == version and cache[1] == self._uid:
+            return cache[2], cache[3]
+        rows = self._conn.execute(
+            "SELECT c.doc_name, c.page, c.text, c.emb FROM chunks c "
+            "JOIN docs d ON d.id = c.doc_id WHERE d.user_id = ?",
+            (self._uid,),
+        ).fetchall()
         if not rows:
-            self._cache = (self._version, [], None)
+            self._shared["cache"] = (version, self._uid, [], None)
             return [], None
         matrix = np.vstack([np.frombuffer(r["emb"], dtype="<f4") for r in rows])
-        self._cache = (self._version, rows, matrix)
+        self._shared["cache"] = (version, self._uid, rows, matrix)
         return rows, matrix
 
     def search(self, query_vec: np.ndarray, k: int = 8) -> list[dict]:

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in — Jarvis</title>
+<style>
+  :root {
+    --canvas: #faf9f5; --ink: #191817; --body: #4b4a46; --muted: #8a8984;
+    --primary: #cc785c; --primary-active: #b9684e; --hairline: #e5e2da;
+    --serif: "Cormorant Garamond", Georgia, serif; --sans: Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--canvas); color: var(--ink);
+    font-family: var(--sans); font-size: 15px; line-height: 1.55;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .card {
+    width: 100%; max-width: 420px;
+    background: #fff; border: 1px solid var(--hairline); border-radius: 12px;
+    padding: 40px 36px; box-shadow: 0 12px 40px rgba(25, 24, 23, 0.06);
+  }
+  .brand { display: flex; align-items: center; justify-content: center; gap: 10px; font-weight: 600; font-size: 18px; margin-bottom: 8px; }
+  .brand svg { color: var(--primary); }
+  .tag { text-align: center; color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .back { display: block; text-align: center; margin-top: 20px; font-size: 13px; color: var(--body); text-decoration: none; }
+  .back:hover { color: var(--ink); }
+  /* Clerk mounts its own UI into this container */
+  #clerk-auth { min-height: 320px; }
+  #clerk-auth .cl-rootBox { margin: 0 auto; }
+  .err { color: #c64545; text-align: center; font-size: 13px; margin-top: 12px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+        <path d="M10 2v16M2 10h16" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+        <path d="M5 5l10 10M15 5l-10 10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".5"/>
+      </svg>
+      Jarvis
+    </div>
+    <div class="tag" id="page-tag">Sign in to your workspace</div>
+    <div id="clerk-auth"></div>
+    <div id="err" class="err hidden"></div>
+    <a class="back" href="/app">← Back to Jarvis</a>
+  </div>
+
+<script>
+/* Standalone auth page: mounts Clerk's SignIn / SignUp component client-side,
+   so auth never depends on Clerk's hosted pages (which can 404 for some
+   instances). The sign-in modal in the app/landing is the primary flow;
+   this page is the redirect fallback. */
+(function () {
+  var mode = location.pathname.indexOf("sign-up") >= 0 ? "sign-up" : "sign-in";
+  document.getElementById("page-tag").textContent =
+    mode === "sign-up" ? "Create your account" : "Sign in to your workspace";
+
+  function showErr(m) {
+    var el = document.getElementById("err");
+    el.textContent = m;
+    el.classList.remove("hidden");
+  }
+
+  fetch("/api/state")
+    .then(function (r) { return r.json(); })
+    .then(function (st) {
+      if (!st.clerk_enabled || !st.clerk_domain || !st.clerk_pk) {
+        location.href = "/app"; // no Clerk configured -> straight to the app
+        return;
+      }
+      var domain = st.clerk_domain, pk = st.clerk_pk;
+      function load(src, attrKey, attrVal) {
+        return new Promise(function (resolve, reject) {
+          var s = document.createElement("script");
+          s.src = src; s.async = true; s.crossOrigin = "anonymous";
+          if (attrKey) s.setAttribute(attrKey, attrVal);
+          s.onload = resolve;
+          s.onerror = function () { reject(new Error("Failed to load " + src)); };
+          document.head.appendChild(s);
+        });
+      }
+      var chain = Promise.resolve();
+      if (!window.__internal_ClerkUICtor) {
+        chain = chain.then(function () {
+          return load("https://" + domain + "/npm/@clerk/ui@1/dist/ui.browser.js");
+        });
+      }
+      if (!window.Clerk) {
+        chain = chain.then(function () {
+          return load("https://" + domain + "/npm/@clerk/clerk-js@6/dist/clerk.browser.js",
+            "data-clerk-publishable-key", pk);
+        });
+      }
+      return chain.then(function () {
+        return window.Clerk.load({ ui: { ClerkUI: window.__internal_ClerkUICtor } });
+      }).then(function () {
+        var mount = mode === "sign-up"
+          ? window.Clerk.mountSignUp
+          : window.Clerk.mountSignIn;
+        mount(document.getElementById("clerk-auth"));
+      });
+    })
+    .catch(function (err) { showErr(String(err && err.message || err)); });
+})();
+</script>
+</body>
+</html>

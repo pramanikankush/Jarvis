@@ -7,7 +7,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 MODULES = ["test_check", "test_envfile", "test_retrieval", "test_tools", "test_spreadsheet",
-           "test_memory", "test_websearch", "test_usagetrack", "test_agent"]
+           "test_memory", "test_websearch", "test_usagetrack", "test_agent", "test_auth",
+           "test_demo_limit"]
 
 
 def main():

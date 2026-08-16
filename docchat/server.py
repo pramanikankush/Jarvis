@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from ragchat import agent as agent_mod  # noqa: E402
-from ragchat import llm, parsing, spreadsheet, store, usagetrack, websearch  # noqa: E402
+from ragchat import auth, llm, parsing, spreadsheet, store, usagetrack, websearch  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("jarvis.server")
@@ -27,6 +27,10 @@ CONFIG_PATH = os.path.join(store.DATA_DIR, "config.json")
 SHEETS_DIR = os.path.join(store.DATA_DIR, "sheets")
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_SHEET_BYTES = 20 * 1024 * 1024
+# Free-demo chat limit: guests and Clerk users may keep at most this many
+# chats. 0 = unlimited. The local workspace (owner) is never limited, so
+# pre-existing local workflows are unaffected. Set DEMO_MAX_CHATS=0 to disable.
+DEMO_MAX_CHATS = int(os.environ.get("DEMO_MAX_CHATS", "3") or "0")
 
 DB = store.Store()
 _config = {"groq_key": "", "model": llm.DEFAULT_MODEL, "tts_voice": llm.TTS_VOICE,
@@ -94,8 +98,29 @@ def get_key() -> str:
     return key
 
 
-def sheet_path(sid: int) -> str | None:
-    s = DB.get_sheet(sid)
+def chat_limit_reached(db, uid: str, limit: int = DEMO_MAX_CHATS) -> bool:
+    """True when a *new* chat must be refused for this user. The free-demo cap
+    applies only to non-local identities (uid != "" — the owner's workspace is
+    never limited) and only when the user already holds `limit` chats.
+    Existing chats always keep working (they are not "new")."""
+    return limit > 0 and bool(uid) and len(db.list_sessions()) >= limit
+
+
+def identity(request: Request) -> auth.User:
+    """Resolve the current user from request headers (clerk > guest > local)."""
+    return auth.resolve_user(
+        authorization=request.headers.get("Authorization", ""),
+        guest_id=request.headers.get("X-Guest-Id", ""),
+    )
+
+
+def scoped(request: Request):
+    """The current user's store view — every query is scoped to their data."""
+    return DB.for_user(identity(request).uid)
+
+
+def sheet_path(sid: int, uid: str = "") -> str | None:
+    s = DB.for_user(uid).get_sheet(sid)
     if not s:
         return None
     ext = ".xlsx" if s["kind"] == "xlsx" else ".csv"
@@ -106,9 +131,17 @@ def sheet_filepath(sid: int, ext: str) -> str:
     return os.path.join(SHEETS_DIR, f"{sid}{ext}")
 
 
-# ---------------- state & config ----------------
+# ---------------- identity & state ----------------
+@app.get("/api/me")
+async def api_me(request: Request):
+    """The current identity: uid (stable workspace key), source, name.
+    Frontend uses this to render the right account chip / headers."""
+    return {"me": identity(request).to_dict(), "clerk_enabled": auth.clerk_enabled()}
+
+
 @app.get("/api/state")
-async def api_state():
+async def api_state(request: Request):
+    db = scoped(request)
     return {
         "key_set": bool(_config["groq_key"]),
         "tavily_set": bool(_config.get("tavily_key")),
@@ -117,15 +150,20 @@ async def api_state():
         "tts_voice": _config.get("tts_voice") or llm.TTS_VOICE,
         "voices": llm.TTS_VOICES,
         "usage": usagetrack.report(_config.get("model") or llm.DEFAULT_MODEL),
-        "docs": DB.list_docs(),
-        "sessions": DB.list_sessions(),
-        "sheets": DB.list_sheets(),
-        "memory_count": len(DB.list_memory()),
+        "me": identity(request).to_dict(),
+        "clerk_enabled": auth.clerk_enabled(),
+        "clerk_pk": auth.CLERK_PUBLISHABLE_KEY if auth.clerk_enabled() else "",
+        "clerk_domain": auth._publishable_domain() if auth.clerk_enabled() else "",
+        "docs": db.list_docs(),
+        "sessions": db.list_sessions(),
+        "sheets": db.list_sheets(),
+        "memory_count": len(db.list_memory()),
+        "demo_max_chats": DEMO_MAX_CHATS if identity(request).uid else 0,
     }
 
 
 @app.get("/api/config")
-async def get_config():
+async def get_config(request: Request):
     return {
         "key_set": bool(_config["groq_key"]),
         "tavily_set": bool(_config.get("tavily_key")),
@@ -133,6 +171,9 @@ async def get_config():
         "tts_voice": _config.get("tts_voice") or llm.TTS_VOICE,
         "voices": llm.TTS_VOICES,
         "usage": usagetrack.report(_config.get("model") or llm.DEFAULT_MODEL),
+        "me": identity(request).to_dict(),
+        "clerk_enabled": auth.clerk_enabled(),
+        "clerk_pk": auth.CLERK_PUBLISHABLE_KEY if auth.clerk_enabled() else "",
     }
 
 
@@ -167,6 +208,7 @@ async def models():
 # ---------------- documents ----------------
 @app.post("/api/docs")
 async def upload_doc(request: Request):
+    db = scoped(request)
     form = await request.form()
     up = form.get("file")
     if not up or not up.filename:
@@ -190,26 +232,28 @@ async def upload_doc(request: Request):
         raise HTTPException(
             503, f"Embedding model failed to start: {e} (first run downloads ~100 MB; needs internet)"
         )
-    existing = {d["name"] for d in DB.list_docs()}
+    existing = {d["name"] for d in db.list_docs()}
     base, ext = os.path.splitext(name)
     i = 2
     while name in existing:
         name = f"{base} ({i}){ext}"
         i += 1
-    doc = await asyncio.to_thread(DB.add_doc, name, len(data), chunks, list(vecs))
-    return JSONResponse({"ok": True, "doc": doc, "docs": DB.list_docs()})
+    doc = await asyncio.to_thread(db.add_doc, name, len(data), chunks, list(vecs))
+    return JSONResponse({"ok": True, "doc": doc, "docs": db.list_docs()})
 
 
 @app.delete("/api/docs/{doc_id}")
-async def delete_doc(doc_id: int):
-    if not DB.delete_doc(doc_id):
+async def delete_doc(doc_id: int, request: Request):
+    db = scoped(request)
+    if not db.delete_doc(doc_id):
         raise HTTPException(404, "Document not found")
-    return {"ok": True, "docs": DB.list_docs()}
+    return {"ok": True, "docs": db.list_docs()}
 
 
 # ---------------- spreadsheets ----------------
 @app.post("/api/sheets")
 async def upload_sheet(request: Request):
+    db = scoped(request)
     form = await request.form()
     up = form.get("file")
     if not up or not up.filename:
@@ -222,7 +266,7 @@ async def upload_sheet(request: Request):
     if len(data) > MAX_SHEET_BYTES:
         raise HTTPException(413, f"File too large (max {MAX_SHEET_BYTES // (1024 * 1024)} MB)")
     os.makedirs(SHEETS_DIR, exist_ok=True)
-    row = DB.add_sheet(name, ext.lstrip("."), 0, 0)
+    row = db.add_sheet(name, ext.lstrip("."), 0, 0)
     path = sheet_filepath(row["id"], ext)
     with open(path, "wb") as f:
         f.write(data)
@@ -230,34 +274,41 @@ async def upload_sheet(request: Request):
     try:
         df = await asyncio.to_thread(spreadsheet.load_sheet, path, ext)
         info = await asyncio.to_thread(spreadsheet.sheet_info, df)
-        DB.update_sheet_rows(row["id"], info["rows"], info["cols"])
-        row = DB.get_sheet(row["id"])
+        db.update_sheet_rows(row["id"], info["rows"], info["cols"])
+        row = db.get_sheet(row["id"])
     except Exception as e:
-        DB.delete_sheet(row["id"])
+        db.delete_sheet(row["id"])
         os.unlink(path)
         raise HTTPException(400, f"Could not parse spreadsheet: {e}")
-    return {"ok": True, "sheet": row, "sheets": DB.list_sheets()}
+    return {"ok": True, "sheet": row, "sheets": db.list_sheets()}
 
 
 @app.get("/api/sheets")
-async def list_sheets():
-    return {"sheets": DB.list_sheets()}
+async def list_sheets(request: Request):
+    return {"sheets": scoped(request).list_sheets()}
 
 
 @app.delete("/api/sheets/{sid}")
-async def delete_sheet(sid: int):
-    if not DB.delete_sheet(sid):
+async def delete_sheet(sid: int, request: Request):
+    db = scoped(request)
+    if not db.delete_sheet(sid):
         raise HTTPException(404, "Spreadsheet not found")
     for ext in (".csv", ".xlsx"):
         p = sheet_filepath(sid, ext)
         if os.path.exists(p):
             os.unlink(p)
-    return {"ok": True, "sheets": DB.list_sheets()}
+    return {"ok": True, "sheets": db.list_sheets()}
 
 
 @app.get("/api/sheets/{sid}/chart")
-async def sheet_chart(sid: int, type: str = "bar", column: str = "", group: str = ""):
-    path = sheet_path(sid)
+async def sheet_chart(sid: int, request: Request, type: str = "bar", column: str = "", group: str = "", uid: str = ""):
+    # charts are embedded via <img src>, which cannot send auth headers, so the
+    # identity may also arrive as a query param (uid is not a secret — it is the
+    # same stable key the client already holds)
+    user = identity(request)
+    if user.source == "local" and uid:
+        user = auth.User(uid=uid, source="guest" if uid.startswith("guest:") else "clerk", name="")
+    path = sheet_path(sid, user.uid)
     if not path:
         raise HTTPException(404, "Spreadsheet not found")
     if type not in ("bar", "line", "hist", "box"):
@@ -308,12 +359,13 @@ async def tts(request: Request):
 
 # ---------------- memory ----------------
 @app.get("/api/memory")
-async def get_memory():
-    return {"memory": DB.list_memory()}
+async def get_memory(request: Request):
+    return {"memory": scoped(request).list_memory()}
 
 
 @app.post("/api/memory")
 async def add_memory(request: Request):
+    db = scoped(request)
     body = await json_body(request)
     fact = (body.get("fact") or "").strip()
     if not fact:
@@ -321,61 +373,73 @@ async def add_memory(request: Request):
     kind = (body.get("kind") or "fact").strip().lower()
     if kind not in ("preference", "personal", "project", "goal", "other", "fact"):
         kind = "fact"
-    row = DB.add_memory(fact, kind)
+    row = db.add_memory(fact, kind)
     if row is None:
-        return {"ok": True, "duplicate": True, "memory": DB.list_memory()}
-    return {"ok": True, "memory": DB.list_memory()}
+        return {"ok": True, "duplicate": True, "memory": db.list_memory()}
+    return {"ok": True, "memory": db.list_memory()}
 
 
 @app.delete("/api/memory/{mid}")
-async def delete_memory(mid: int):
-    if not DB.delete_memory(mid):
+async def delete_memory(mid: int, request: Request):
+    db = scoped(request)
+    if not db.delete_memory(mid):
         raise HTTPException(404, "Memory not found")
-    return {"ok": True, "memory": DB.list_memory()}
+    return {"ok": True, "memory": db.list_memory()}
 
 
 # ---------------- sessions ----------------
 @app.post("/api/sessions")
-async def new_session():
-    return DB.create_session("New chat")
+async def new_session(request: Request):
+    db = scoped(request)
+    u = identity(request)
+    if chat_limit_reached(db, u.uid):
+        raise HTTPException(
+            429,
+            f"Free demo limited to {DEMO_MAX_CHATS} chats — delete an old chat to start a new one.",
+        )
+    return db.create_session("New chat")
 
 
 @app.get("/api/sessions")
-async def list_sessions(q: str = ""):
-    sessions = DB.search_sessions(q) if q.strip() else DB.list_sessions()
+async def list_sessions(request: Request, q: str = ""):
+    db = scoped(request)
+    sessions = db.search_sessions(q) if q.strip() else db.list_sessions()
     return {"sessions": sessions}
 
 
 @app.patch("/api/sessions/{sid}")
 async def patch_session(sid: str, request: Request):
+    db = scoped(request)
     body = await json_body(request)
-    if not DB.get_session(sid):
+    if not db.get_session(sid):
         raise HTTPException(404, "Session not found")
     title = (body.get("title") or "").strip()
     if title:
-        DB.set_title(sid, title[:200])
+        db.set_title(sid, title[:200])
     if "pinned" in body:
-        DB.set_pinned(sid, bool(body["pinned"]))
-    return {"ok": True, "session": DB.get_session(sid)}
+        db.set_pinned(sid, bool(body["pinned"]))
+    return {"ok": True, "session": db.get_session(sid)}
 
 
 @app.delete("/api/sessions/{sid}")
-async def delete_session(sid: str):
-    if not DB.delete_session(sid):
+async def delete_session(sid: str, request: Request):
+    if not scoped(request).delete_session(sid):
         raise HTTPException(404, "Session not found")
     return {"ok": True}
 
 
 @app.get("/api/sessions/{sid}/messages")
-async def session_messages(sid: str):
-    if not DB.get_session(sid):
+async def session_messages(sid: str, request: Request):
+    db = scoped(request)
+    if not db.get_session(sid):
         raise HTTPException(404, "Session not found")
-    return {"messages": DB.messages(sid)}
+    return {"messages": db.messages(sid)}
 
 
 @app.get("/api/sessions/{sid}/export")
-async def export_session(sid: str):
-    data = DB.export_session(sid)
+async def export_session(sid: str, request: Request):
+    db = scoped(request)
+    data = db.export_session(sid)
     if not data:
         raise HTTPException(404, "Session not found")
     filename = f"jarvis-chat-{sid[:8]}.json"
@@ -394,14 +458,25 @@ async def chat(request: Request):
     if not question:
         raise HTTPException(400, "Empty question")
     sid = body.get("session_id") or None
+    user = identity(request)
+    db = DB.for_user(user.uid)
 
     async def gen():
         try:
-            if sid and DB.get_session(sid):
+            if sid and db.get_session(sid):
                 session_id = sid
-                history = [m for m in DB.messages(sid) if m["role"] in ("user", "assistant")][-20:]
+                history = [m for m in db.messages(sid) if m["role"] in ("user", "assistant")][-20:]
             else:
-                session_id = DB.create_session(question[:70] or "New chat")["id"]
+                # free-demo cap: a new chat needs a free slot (existing chats
+                # keep working); the owner's local workspace is never limited
+                if chat_limit_reached(db, user.uid):
+                    yield sse_error(
+                        f"Free demo limited to {DEMO_MAX_CHATS} chats — "
+                        "delete an old chat to start a new one."
+                    )
+                    yield sse({"type": "done", "answer": "", "sources": []})
+                    return
+                session_id = db.create_session(question[:70] or "New chat")["id"]
                 history = []
 
             key = _config.get("groq_key")
@@ -410,16 +485,17 @@ async def chat(request: Request):
                 yield sse({"type": "done", "answer": "", "sources": []})
                 return
 
-            DB.add_message(session_id, "user", question)
+            db.add_message(session_id, "user", question)
             yield sse({"type": "start", "session_id": session_id})
 
             a = agent_mod.Agent(
                 key=key,
                 model=_config.get("model") or llm.DEFAULT_MODEL,
-                store=DB,
+                store=db,
                 embed_fn=llm.embed_query,
-                get_sheet_path=sheet_path,
+                get_sheet_path=lambda s: sheet_path(s, user.uid),
                 is_disconnected=lambda: request.is_disconnected(),
+                uid=user.uid,
             )
             answer, sources = "", []
             saw_done = False
@@ -452,7 +528,7 @@ async def chat(request: Request):
 
             if answer.strip():
                 kept = [{**s, "text": (s.get("text") or "")[:500]} for s in sources]
-                DB.add_message(session_id, "assistant", answer, kept)
+                db.add_message(session_id, "assistant", answer, kept)
         except Exception as e:
             log.exception("chat failed")
             yield sse_error(f"Chat error: {e}")
@@ -478,6 +554,21 @@ async def app_index():
     own the root URL. All app assets/APIs use absolute paths (/style.css,
     /app.js, /api/...), so nothing breaks at this sub-path."""
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/sign-in")
+async def sign_in_page():
+    """Standalone Clerk sign-in page. The app/landing open Clerk's modal by
+    default; when the modal cannot mount (some browsers), Clerk redirects to
+    signInUrl/signUpUrl — we serve our own page so auth never hits Clerk's
+    hosted pages (which can 404 for some instances)."""
+    return FileResponse(os.path.join(STATIC_DIR, "signin.html"))
+
+
+@app.get("/sign-up")
+async def sign_up_page():
+    """Standalone Clerk sign-up page (see sign-in for rationale)."""
+    return FileResponse(os.path.join(STATIC_DIR, "signin.html"))
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
