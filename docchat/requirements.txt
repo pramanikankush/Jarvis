@@ -1,0 +1,11 @@
+fastapi
+python-multipart
+uvicorn[standard]
+fastembed          # local embeddings (bge-small, ONNX) — first run downloads ~100 MB
+pypdf
+python-docx
+httpx
+pandas             # spreadsheet analysis
+openpyxl           # .xlsx support for pandas
+matplotlib         # charts (headless Agg backend)
+ddgs               # free keyless web search (DuckDuckGo)

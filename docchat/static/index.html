@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis — your AI assistant</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23cc785c'/><path d='M50 22v56M22 50h56' stroke='%23faf9f5' stroke-width='10' stroke-linecap='round'/><path d='M33 33l34 34M67 33L33 67' stroke='%23faf9f5' stroke-width='7' stroke-linecap='round' opacity='.6'/></svg>">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M10 2v16M2 10h16" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+          <path d="M5 5l10 10M15 5l-10 10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".5"/>
+        </svg>
+      </span><span>Jarvis</span>
+    </div>
+    <div class="sidebar-scroll">
+      <section class="docs-section">
+        <div class="section-head">
+          <span>Documents</span>
+          <button id="btn-add" class="mini-btn" title="Add files">＋</button>
+        </div>
+        <div id="dropzone" class="dropzone">
+          Drop files here or click to add
+          <small>PDF · DOCX · TXT · CSV · MD</small>
+        </div>
+        <input type="file" id="file-input" multiple hidden
+               accept=".pdf,.docx,.txt,.md,.markdown,.csv">
+        <div id="indexing-note" class="indexing-note hidden"></div>
+        <ul id="docs-list" class="docs-list"></ul>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <span>Spreadsheets</span>
+          <button id="btn-add-sheet" class="mini-btn" title="Add spreadsheet">＋</button>
+        </div>
+        <input type="file" id="sheet-input" hidden accept=".csv,.xlsx">
+        <ul id="sheets-list" class="docs-list"></ul>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <span>Memory</span>
+          <button id="btn-refresh-memory" class="mini-btn" title="Refresh">↻</button>
+        </div>
+        <div class="mem-add-row">
+          <input type="text" id="mem-input" class="mem-input" placeholder="Add a fact… (e.g. 'prefers short answers')" aria-label="Add memory fact">
+          <button id="btn-mem-add" class="mini-btn" title="Save fact">＋</button>
+        </div>
+        <ul id="memory-list" class="docs-list"></ul>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <span>Chats</span>
+          <button id="btn-new" class="mini-btn" title="New chat" aria-label="New chat">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+              <path d="M6 1.5v9M1.5 6h9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <input type="search" id="chat-search" class="chat-search" placeholder="Search chats…" aria-label="Search chats">
+        <ul id="sessions-list" class="sessions-list"></ul>
+      </section>
+    </div>
+    <div class="sidebar-foot">
+      <div id="quota" class="quota hidden" title="Groq daily token usage">
+        <div class="quota-bar"><div id="quota-fill" class="quota-fill"></div></div>
+        <span id="quota-text" class="quota-text"></span>
+      </div>
+      <div class="sidebar-foot-row">
+        <span id="stat-line" class="stat"></span>
+        <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <circle cx="8" cy="8" r="2.5" stroke="currentColor" stroke-width="1.4"/>
+          <path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        </svg>
+      </button>
+      </div>
+    </div>
+  </aside>
+
+  <div id="sidebar-resizer" role="separator" aria-orientation="vertical"
+       aria-label="Resize sidebar" aria-valuenow="360" aria-valuemin="260"
+       aria-valuemax="480" tabindex="0" title="Drag to resize sidebar"></div>
+
+  <main>
+    <div id="chat-scroll">
+      <div id="chat"></div>
+      <div id="empty-state" class="empty-state">
+        <div class="empty-logo" aria-hidden="true">
+          <svg width="26" height="26" viewBox="0 0 20 20" fill="none">
+            <path d="M10 2v16M2 10h16" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+            <path d="M5 5l10 10M15 5l-10 10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".5"/>
+          </svg>
+        </div>
+        <h1>Hi, I'm Jarvis</h1>
+        <p>Ask me anything — your documents, spreadsheets, the web, or quick math. Voice input is supported via the mic button.</p>
+        <div class="chips">
+          <button class="chip" data-q="What can you do?">What can you do?</button>
+          <button class="chip" data-q="Summarize my uploaded documents">Summarize my documents</button>
+          <button class="chip" data-q="Analyze my spreadsheet: give me an overview of the data">Analyze my spreadsheet</button>
+          <button class="chip" data-q="Calculate 17% of 2350">Calculate something</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="key-banner" class="key-banner hidden">
+      Add your Groq API key to start chatting.
+      <button id="btn-key-banner" class="mini-btn">Open Settings</button>
+    </div>
+
+    <div id="composer" class="composer">
+      <div class="composer-box">
+        <button id="btn-mic" class="mic-btn" title="Voice input — click to start/stop recording" aria-label="Voice input">
+          <svg width="15" height="16" viewBox="0 0 15 16" fill="none" aria-hidden="true">
+            <rect x="4.5" y="1" width="6" height="9.5" rx="3" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M2.5 7.5a5 5 0 0 0 10 0M7.5 12.5V15M5 15h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <textarea id="input" rows="1"
+          placeholder="Ask me anything… (Enter to send, Shift+Enter for new line)"></textarea>
+        <button id="btn-send" class="send-btn" title="Send" aria-label="Send message">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="composer-hint">I can search your documents, analyze spreadsheets, and browse the web.</div>
+    </div>
+  </main>
+</div>
+
+<div id="modal-settings" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <span>Settings</span>
+      <button id="btn-close-settings" class="icon-btn">✕</button>
+    </div>
+    <label class="field-label" for="key-input">Groq API Key</label>
+    <div class="key-row">
+      <input type="password" id="key-input" placeholder="gsk_…" autocomplete="off">
+      <button id="btn-save-key" class="primary-btn">Save</button>
+    </div>
+    <div id="key-status" class="key-status"></div>
+    <div id="quota-settings" class="quota hidden">
+      <div class="quota-head">
+        <span>Groq daily token usage</span>
+        <span id="quota-settings-pct" class="quota-pct"></span>
+      </div>
+      <div class="quota-bar"><div id="quota-settings-fill" class="quota-fill"></div></div>
+      <span id="quota-settings-text" class="quota-text"></span>
+    </div>
+    <label class="field-label" for="tavily-input">Tavily API Key <span class="opt-note">(optional — for web search)</span></label>
+    <div class="key-row">
+      <input type="password" id="tavily-input" placeholder="tvly_…" autocomplete="off">
+    </div>
+    <div id="tavily-status" class="key-status"></div>
+    <label class="field-label" for="model-select">Model</label>
+    <select id="model-select"></select>
+    <div id="model-status" class="key-status"></div>
+
+    <div class="settings-row">
+      <label class="field-label" for="voice-select" style="flex:1">Voice (TTS)</label>
+      <label class="toggle">
+        <input type="checkbox" id="tts-toggle">
+        <span>Speak responses</span>
+      </label>
+    </div>
+    <select id="voice-select"></select>
+    <div id="voice-status" class="key-status"></div>
+
+    <p class="modal-note">
+      Your keys are stored only on this machine (<code>data/config.json</code>) and sent only to
+      <code>api.groq.com</code> / <code>api.tavily.com</code>. You can also set the
+      <code>GROQ_API_KEY</code> and <code>TAVILY_API_KEY</code> environment variables (those win over the UI).
+      The optional Tavily key enables web search; without it, search falls back to the built-in keyless DuckDuckGo.
+      Speech-to-text and text-to-speech also use Groq (Whisper + Orpheus). Embeddings and storage run 100% locally.
+    </p>
+    <div class="modal-actions">
+      <button id="btn-test" class="ghost-btn">Test connection</button>
+      <button id="btn-clear-key" class="ghost-btn danger-text">Remove key</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

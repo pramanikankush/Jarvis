@@ -1,0 +1,28 @@
+# ---------- secrets & local config ----------
+docchat/.env
+docchat/data/config.json
+*.local
+
+# ---------- user data (database, uploads, usage) ----------
+docchat/data/
+
+# ---------- python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ---------- runtime logs ----------
+*.log
+docchat/server_out.log
+docchat/server_err.log
+
+# ---------- editor / OS ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---------- tool state (Freebuff) ----------
+.freebuff/

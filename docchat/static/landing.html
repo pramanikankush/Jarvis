@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis — your personal AI workspace</title>
+<meta name="description" content="Jarvis is your personal AI workspace: chat, RAG over your documents, spreadsheet analysis, web search, memory, and voice — in one place.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23cc785c'/><path d='M50 22v56M22 50h56' stroke='%23faf9f5' stroke-width='10' stroke-linecap='round'/><path d='M33 33l34 34M67 33L33 67' stroke='%23faf9f5' stroke-width='7' stroke-linecap='round' opacity='.6'/></svg>">
+<style>
+  :root {
+    --primary: #cc785c;
+    --primary-active: #a9583e;
+    --ink: #141413;
+    --body: #3d3d3a;
+    --muted: #6c6a64;
+    --muted-soft: #8e8b82;
+    --hairline: #e6dfd8;
+    --hairline-soft: #ebe6df;
+    --canvas: #faf9f5;
+    --surface-soft: #f5f0e8;
+    --surface-card: #efe9de;
+    --surface-dark: #181715;
+    --surface-dark-elevated: #252320;
+    --surface-dark-soft: #1f1e1b;
+    --on-dark: #faf9f5;
+    --on-dark-soft: #a09d96;
+    --teal: #5db8a6;
+    --serif: "Cormorant Garamond", "Tiempos Headline", Georgia, serif;
+    --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--canvas);
+    color: var(--body);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: inherit; text-decoration: none; }
+
+  .container { max-width: 1200px; margin: 0 auto; padding: 0 32px; }
+
+  /* ---------------- top nav ---------------- */
+  .nav {
+    position: sticky; top: 0; z-index: 50;
+    height: 64px;
+    background: rgba(250, 249, 245, 0.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--hairline-soft);
+  }
+  .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); font-weight: 500; font-size: 15px; }
+  .brand .logo { display: inline-flex; color: var(--primary); }
+  .nav-links { display: flex; align-items: center; gap: 28px; }
+  .nav-links a { font-size: 14px; font-weight: 500; color: var(--body); transition: color 0.15s; }
+  .nav-links a:hover { color: var(--ink); }
+
+  /* ---------------- buttons ---------------- */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    height: 40px; padding: 0 20px;
+    border-radius: 8px; border: 1px solid transparent;
+    font-family: var(--sans); font-size: 14px; font-weight: 500; line-height: 1;
+    cursor: pointer; transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+    white-space: nowrap;
+  }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover { background: var(--primary-active); }
+  .btn-secondary { background: var(--canvas); color: var(--ink); border-color: var(--hairline); }
+  .btn-secondary:hover { border-color: var(--muted-soft); }
+  .btn-on-dark { background: var(--surface-dark-elevated); color: var(--on-dark); }
+  .btn-on-dark:hover { background: #2e2b28; }
+  .btn-on-coral { background: var(--canvas); color: var(--ink); }
+  .btn-on-coral:hover { background: #fff; }
+
+  /* ---------------- hero ---------------- */
+  .hero { padding: 96px 0 72px; }
+  .hero-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; align-items: center; }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 4px 12px; border-radius: 9999px;
+    background: var(--surface-card); color: var(--ink);
+    font-size: 12px; font-weight: 500; letter-spacing: 1.5px; text-transform: uppercase;
+  }
+  .hero h1 {
+    margin-top: 24px;
+    font-family: var(--serif); font-weight: 500; font-size: 64px; line-height: 1.05;
+    letter-spacing: -1.5px; color: var(--ink);
+  }
+  .hero h1 em { font-style: italic; color: var(--primary); }
+  .hero .lede {
+    margin-top: 20px; max-width: 460px;
+    font-size: 18px; line-height: 1.6; color: var(--muted);
+  }
+  .hero-actions { display: flex; gap: 12px; margin-top: 32px; flex-wrap: wrap; }
+  .hero-note { margin-top: 16px; font-size: 13px; color: var(--muted-soft); }
+
+  .hero-art {
+    position: relative;
+    background: var(--surface-dark); color: var(--on-dark);
+    border-radius: 16px; padding: 28px;
+    box-shadow: 0 24px 60px rgba(20, 20, 19, 0.16);
+  }
+  .mock-chrome {
+    display: flex; align-items: center; gap: 6px;
+    padding-bottom: 16px; margin-bottom: 16px;
+    border-bottom: 1px solid rgba(250, 249, 245, 0.08);
+  }
+  .mock-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--surface-dark-elevated); }
+  .mock-dot:first-child { background: var(--primary); }
+  .mock-title { margin-left: 8px; font-size: 12px; color: var(--on-dark-soft); font-family: var(--mono); }
+
+  .mock-window { border: 1px solid rgba(250, 249, 245, 0.1); border-radius: 12px; background: var(--surface-dark-soft); padding: 16px; }
+  .mock-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: flex-start; }
+  .mock-row:last-child { margin-bottom: 0; }
+  .mock-avatar {
+    flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    margin-top: 2px;
+  }
+  .mock-avatar.user { background: var(--surface-dark-elevated); color: var(--on-dark-soft); }
+  .mock-avatar.ai { background: var(--primary); color: #fff; }
+  .mock-avatar svg { width: 13px; height: 13px; }
+  .mock-bubble {
+    font-size: 13px; line-height: 1.5; color: var(--on-dark);
+    background: var(--surface-dark-elevated); border-radius: 10px 10px 10px 2px;
+    padding: 8px 12px;
+  }
+  .mock-bubble.ai { background: var(--surface-dark-soft); border: 1px solid rgba(250, 249, 245, 0.1); border-radius: 10px 10px 2px 10px; }
+  .mock-bubble.ai strong { color: var(--on-dark); font-weight: 500; }
+  .mock-bubble .src {
+    display: inline-block; margin-top: 8px;
+    padding: 3px 8px; border-radius: 6px;
+    background: rgba(93, 184, 166, 0.14); color: var(--teal);
+    font-family: var(--mono); font-size: 11px;
+  }
+  .mock-status { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 12px; color: var(--on-dark-soft); }
+  .mock-status .ok { color: var(--teal); }
+  .mock-status .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--teal); }
+
+  /* ---------------- sections ---------------- */
+  .band { padding: 96px 0; }
+  .band-cream-card { background: var(--surface-soft); }
+  .band-dark { background: var(--surface-dark); color: var(--on-dark); }
+
+  .sec-head { max-width: 640px; margin-bottom: 56px; }
+  .sec-head .kicker {
+    font-size: 12px; font-weight: 500; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--primary);
+  }
+  .sec-head h2 {
+    margin-top: 14px;
+    font-family: var(--serif); font-weight: 500; font-size: 44px; line-height: 1.1;
+    letter-spacing: -1px; color: var(--ink);
+  }
+  .sec-head p { margin-top: 14px; font-size: 16px; color: var(--muted); }
+  .band-dark .sec-head h2 { color: var(--on-dark); }
+  .band-dark .sec-head p { color: var(--on-dark-soft); }
+
+  /* ---------------- features ---------------- */
+  .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .feature {
+    background: var(--surface-card); border-radius: 12px; padding: 32px;
+  }
+  .feature .f-icon {
+    width: 40px; height: 40px; border-radius: 10px;
+    background: var(--canvas); border: 1px solid var(--hairline);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--primary); margin-bottom: 20px;
+  }
+  .feature h3 { font-family: var(--sans); font-size: 18px; font-weight: 500; color: var(--ink); margin-bottom: 10px; }
+  .feature p { font-size: 14px; line-height: 1.6; color: var(--muted); }
+
+  /* ---------------- pipeline band ---------------- */
+  .pipeline {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px;
+    margin-top: 8px;
+  }
+  .pipe-step {
+    background: var(--surface-dark-elevated); border-radius: 12px; padding: 24px 20px;
+    border: 1px solid rgba(250, 249, 245, 0.06);
+  }
+  .pipe-step .n {
+    font-family: var(--mono); font-size: 12px; color: var(--primary);
+    letter-spacing: 1px;
+  }
+  .pipe-step h4 { margin-top: 10px; font-size: 15px; font-weight: 500; color: var(--on-dark); }
+  .pipe-step p { margin-top: 6px; font-size: 12.5px; line-height: 1.55; color: var(--on-dark-soft); }
+
+  /* ---------------- CTA band ---------------- */
+  .cta-band {
+    background: var(--primary); border-radius: 12px;
+    padding: 64px 48px; text-align: center;
+  }
+  .cta-band h2 {
+    font-family: var(--serif); font-weight: 500; font-size: 36px; line-height: 1.15;
+    letter-spacing: -0.5px; color: #fff;
+  }
+  .cta-band p { margin-top: 12px; font-size: 16px; color: rgba(255, 255, 255, 0.85); }
+  .cta-band .btn { margin-top: 28px; }
+  .cta-note { margin-top: 14px; font-size: 12.5px; color: rgba(255, 255, 255, 0.7); }
+
+  /* ---------------- footer ---------------- */
+  .footer { background: var(--surface-dark); color: var(--on-dark-soft); padding: 64px 0 48px; }
+  .footer-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 40px; flex-wrap: wrap; }
+  .footer .brand { color: var(--on-dark); }
+  .footer .brand .logo { color: var(--primary); }
+  .footer .blurb { margin-top: 12px; max-width: 300px; font-size: 13.5px; line-height: 1.6; }
+  .footer-cols { display: flex; gap: 72px; flex-wrap: wrap; }
+  .footer-cols .col h5 {
+    font-size: 12px; font-weight: 500; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--on-dark); margin-bottom: 14px;
+  }
+  .footer-cols .col a { display: block; font-size: 13.5px; margin-bottom: 9px; transition: color 0.15s; }
+  .footer-cols .col a:hover { color: var(--on-dark); }
+  .footer-bottom {
+    margin-top: 48px; padding-top: 24px;
+    border-top: 1px solid rgba(250, 249, 245, 0.08);
+    display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    font-size: 12.5px;
+  }
+
+  /* ---------------- responsive ---------------- */
+  /* tablet: hero stays 6/6 (collapses only <768 per design system),
+     type scales down, feature cards 2-up, pipeline 3-up */
+  @media (max-width: 1024px) {
+    .hero h1 { font-size: 44px; }
+    .hero-grid { gap: 48px; }
+    .features { grid-template-columns: repeat(2, 1fr); }
+    .pipeline { grid-template-columns: repeat(3, 1fr); }
+    .footer-cols { gap: 48px; }
+  }
+  /* mobile: hero stacks, nav keeps the Try-now CTA (plain links hide),
+     feature cards 1-up, pipeline 2-up with the final step spanning full width */
+  @media (max-width: 768px) {
+    .container { padding: 0 20px; }
+    .hero { padding: 64px 0 48px; }
+    .band { padding: 64px 0; }
+    .hero-grid { grid-template-columns: 1fr; gap: 40px; }
+    .hero h1 { font-size: 32px; letter-spacing: -0.5px; }
+    .nav-links { gap: 0; }
+    .nav-links a:not(.btn) { display: none; }
+    .sec-head h2 { font-size: 32px; }
+    .features { grid-template-columns: 1fr; }
+    .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .pipeline .pipe-step:last-child { grid-column: 1 / -1; }
+    .mock-status { flex-wrap: wrap; }
+    .mock-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cta-band { padding: 48px 24px; }
+    .cta-band h2 { font-size: 28px; }
+    .footer-cols { gap: 40px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- top nav -->
+<header class="nav">
+  <div class="container nav-inner">
+    <a href="/" class="brand" aria-label="Jarvis home">
+      <span class="logo" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M10 2v16M2 10h16" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+          <path d="M5 5l10 10M15 5l-10 10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".5"/>
+        </svg>
+      </span>
+      <span>Jarvis</span>
+    </a>
+    <nav class="nav-links" aria-label="Primary">
+      <a href="#features">Features</a>
+      <a href="#pipeline">How it works</a>
+      <a href="/app" class="btn btn-primary">Try now</a>
+    </nav>
+  </div>
+</header>
+
+<!-- hero -->
+<section class="hero">
+  <div class="container hero-grid">
+    <div>
+      <span class="eyebrow">Your personal AI workspace</span>
+      <h1>Ask anything. <em>Jarvis</em> handles the rest.</h1>
+      <p class="lede">One assistant for your documents, spreadsheets, the web, and quick math — with memory, voice, and honest, cited answers. Runs locally on your machine.</p>
+      <div class="hero-actions">
+        <a href="/app" class="btn btn-primary">Try now</a>
+        <a href="#features" class="btn btn-secondary">See what it does</a>
+      </div>
+      <p class="hero-note">Free to run · your keys, your data · no account needed</p>
+    </div>
+
+    <div class="hero-art" aria-hidden="true">
+      <div class="mock-chrome">
+        <span class="mock-dot"></span><span class="mock-dot"></span><span class="mock-dot"></span>
+        <span class="mock-title">jarvis — spreadsheet analysis</span>
+      </div>
+      <div class="mock-window">
+        <div class="mock-row">
+          <span class="mock-avatar user">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="5.5" r="2.6" stroke="currentColor" stroke-width="1.4"/><path d="M2.8 13.2a5.4 5.4 0 0 1 10.4 0" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          </span>
+          <span class="mock-bubble">Which region generated the highest revenue?</span>
+        </div>
+        <div class="mock-status">
+          <span class="dot"></span><span class="ok">Understanding question</span>
+          <span class="dot"></span><span class="ok">Inspecting spreadsheet</span>
+        </div>
+        <div class="mock-row">
+          <span class="mock-avatar ai">
+            <svg viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </span>
+          <span class="mock-bubble ai">
+            APAC led with <strong>$2.4M</strong> — 41% of total revenue.
+            <span class="src">sales-2026.xlsx</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- features -->
+<section class="band band-cream-card" id="features">
+  <div class="container">
+    <div class="sec-head">
+      <span class="kicker">Capabilities</span>
+      <h2>Everything a personal assistant should do.</h2>
+      <p>Jarvis routes each question to the right tool automatically — you never pick a mode.</p>
+    </div>
+    <div class="features">
+      <div class="feature">
+        <div class="f-icon"><svg width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M3 2h7l3 3v9H3V2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M10 2v3h3M5.5 8h5M5.5 10.5h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></div>
+        <h3>Document RAG</h3>
+        <p>Upload PDFs, DOCX, TXT and MD. Jarvis chunks, embeds, and answers with hybrid search plus citations — source name, page, and passage.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon"><svg width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M2 3h12v10H2V3z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M2 6.5h12M6 3v10" stroke="currentColor" stroke-width="1.4"/></svg></div>
+        <h3>Spreadsheet analysis</h3>
+        <p>Ask about your CSV or XLSX in plain language — aggregations, filters, trends, outliers, and charts — without writing a line of code.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon"><svg width="18" height="18" viewBox="0 0 16 16" fill="none"><circle cx="7.5" cy="7.5" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M11 11l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></div>
+        <h3>Web search</h3>
+        <p>Current questions trigger a real-time search with sources shown. Jarvis decides when to search — it won't hit the web for what it already knows.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon"><svg width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M2.5 8a5.5 5.5 0 0 1 11 0M4.5 8a3.5 3.5 0 0 1 7 0M6.5 8a1.5 1.5 0 0 1 3 0M8 12.5v2.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></div>
+        <h3>Memory</h3>
+        <p>Jarvis remembers what you ask it to — preferences and facts — and updates them when you change your mind. Nothing is stored silently.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon"><svg width="18" height="18" viewBox="0 0 16 16" fill="none"><rect x="5" y="1.5" width="6" height="9" rx="3" stroke="currentColor" stroke-width="1.4"/><path d="M3 8a5 5 0 0 0 10 0M8 13v2.5M5.5 15.5h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></div>
+        <h3>Voice</h3>
+        <p>Talk to Jarvis and hear answers back — speech-to-text and text-to-speech on the same agent, so voice and chat share one brain.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon"><svg width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M6 1.5h4M7 1.5v2M9 1.5v2M4.5 4.5h7l-1 10h-5l-1-10z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M6.5 8.5l3-2M6.5 8.5l1-1M9.5 8.5l-3-2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></div>
+        <h3>Tools &amp; math</h3>
+        <p>Calculations, safe data analysis, and agentic RAG with self-verification — each tool fails gracefully and explains itself when it can't help.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- pipeline -->
+<section class="band band-dark" id="pipeline">
+  <div class="container">
+    <div class="sec-head">
+      <span class="kicker">How it works</span>
+      <h2>One agent. The right tool, automatically.</h2>
+      <p>Every question flows through a single router — documents, data, web, memory, or the model itself. You see the high-level steps, never the reasoning.</p>
+    </div>
+    <div class="pipeline">
+      <div class="pipe-step">
+        <div class="n">01</div>
+        <h4>Understand</h4>
+        <p>Jarvis reads your question and figures out intent — conversational, document, data, or current-events.</p>
+      </div>
+      <div class="pipe-step">
+        <div class="n">02</div>
+        <h4>Route</h4>
+        <p>An intent router picks the tool: RAG, spreadsheet agent, web search, calculator, memory, or plain LLM.</p>
+      </div>
+      <div class="pipe-step">
+        <div class="n">03</div>
+        <h4>Retrieve</h4>
+        <p>Hybrid search blends vector similarity and keyword BM25, then reranks for the most relevant chunks.</p>
+      </div>
+      <div class="pipe-step">
+        <div class="n">04</div>
+        <h4>Verify</h4>
+        <p>Self-RAG checks that sources are relevant and the answer is actually supported by evidence.</p>
+      </div>
+      <div class="pipe-step">
+        <div class="n">05</div>
+        <h4>Answer</h4>
+        <p>Citations and sources come back with every answer — never fabricated, always distinguishable.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="band">
+  <div class="container">
+    <div class="cta-band">
+      <h2>Meet your thinking partner.</h2>
+      <p>Open Jarvis and ask your first question — it's ready when you are.</p>
+      <a href="/app" class="btn btn-on-coral">Try now</a>
+      <p class="cta-note">Local-first · works with your Groq key · voice, RAG, spreadsheets, and more</p>
+    </div>
+  </div>
+</section>
+
+<!-- footer -->
+<footer class="footer">
+  <div class="container">
+    <div class="footer-top">
+      <div>
+        <span class="brand">
+          <span class="logo" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+              <path d="M10 2v16M2 10h16" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+              <path d="M5 5l10 10M15 5l-10 10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".5"/>
+            </svg>
+          </span>
+          <span>Jarvis</span>
+        </span>
+        <p class="blurb">A personal AI workspace that answers from your documents, your data, and the web — with memory and voice, all on your machine.</p>
+      </div>
+      <div class="footer-cols">
+        <div class="col">
+          <h5>Workspace</h5>
+          <a href="/app">Open chat</a>
+          <a href="/app">Documents</a>
+          <a href="/app">Spreadsheets</a>
+          <a href="/app">Memory</a>
+        </div>
+        <div class="col">
+          <h5>Capabilities</h5>
+          <a href="#features">Document RAG</a>
+          <a href="#features">Web search</a>
+          <a href="#features">Data analysis</a>
+          <a href="#features">Voice</a>
+        </div>
+        <div class="col">
+          <h5>Resources</h5>
+          <a href="#pipeline">How it works</a>
+          <a href="/app">Settings</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 Jarvis. Built with care, locally.</span>
+      <span>Your keys and documents never leave this machine.</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
