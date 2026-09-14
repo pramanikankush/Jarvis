@@ -11,10 +11,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Install dependencies first (layer caching) and pre-download the embedding
-# model so the runtime image needs no internet for embeddings.
+# model so the runtime image needs no internet for embeddings. The OCR engine
+# is instantiated once here to prove the scan-parsing stack works in the image.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
+    && python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" \
+    && python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR()"
 
 COPY . .
 

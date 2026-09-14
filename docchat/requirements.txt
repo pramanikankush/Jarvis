@@ -4,6 +4,13 @@ uvicorn[standard]
 fastembed          # local embeddings (bge-small, ONNX) — first run downloads ~100 MB
 pypdf
 python-docx
+python-pptx       # PowerPoint (.pptx) slide + notes extraction
+
+# Document parser extras: OCR for scanned/image-only PDFs and image files
+# (RapidOCR models ship inside the wheel — nothing is downloaded at runtime)
+rapidocr-onnxruntime
+pypdfium2          # renders PDF pages to images for OCR
+pillow
 httpx
 pyjwt              # Clerk session JWT verification (ragchat/auth.py)
 cryptography       # JWKS key loading for PyJWT (ragchat/auth.py)

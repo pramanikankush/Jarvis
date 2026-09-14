@@ -939,7 +939,7 @@ async function uploadFiles(files) {
 }
 
 /* ---------------- chat attachments (📎) ---------------- */
-const ATTACH_EXTS = [".pdf", ".docx", ".txt", ".md", ".markdown", ".csv"];
+const ATTACH_EXTS = [".pdf", ".docx", ".pptx", ".odt", ".rtf", ".html", ".htm", ".json", ".txt", ".md", ".markdown", ".csv", ".log", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"];
 const attachChipsEl = $("#attach-chips");
 
 function stageAttachFiles(files) {

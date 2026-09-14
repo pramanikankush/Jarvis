@@ -18,7 +18,7 @@ verifies, and streams a grounded answer with citations.
 - **Works with any Groq chat model**; voice uses Groq Whisper (STT) + Groq Orpheus (TTS).
 - **Multi-user ready**: optional Clerk authentication with per-user workspace isolation,
   plus a guest mode and a legacy local mode — one database, scoped queries.
-- **143 tests across 15 suites**, all runnable offline.
+- **161 tests across 16 suites**, all runnable offline.
 
 The code lives in [`docchat/`](docchat/). [`docchat/README.md`](docchat/README.md) is the
 developer deep-dive (module layout, trade-offs, internals).
@@ -51,7 +51,8 @@ developer deep-dive (module layout, trade-offs, internals).
 | Capability | What happens | Tech |
 |---|---|---|
 | **Text chat** | Streaming answers (SSE), markdown, tool-activity status | FastAPI, vanilla JS |
-| **Document RAG** | Upload PDF/DOCX/TXT/CSV/MD → parse → chunk → embed → hybrid retrieve → cite | pypdf, python-docx, fastembed |
+| **Document RAG** | Upload PDF/DOCX/PPTX/ODT/RTF/HTML/JSON/TXT/CSV/MD → parse → chunk → embed → hybrid retrieve → cite | pypdf, python-docx, python-pptx, fastembed |
+| **OCR (scans & images)** | Image-only PDFs and screenshots/photos of documents are read via local OCR — no external service | RapidOCR (ONNX), pypdfium2, Pillow |
 | **Attach & analyze (📎)** | Attach a file to any chat message — parsed and indexed instantly, the agent reads it first and answers with citations | shared ingest pipeline (`ragchat/ingest.py`) |
 | **Hybrid retrieval** | Vector cosine **+** FTS5 BM25, fused with **Reciprocal Rank Fusion**, relevance-gated | SQLite FTS5, numpy |
 | **Agentic RAG** | The agent decides *whether* to search, rewrites queries, re-searches when evidence is thin | JSON-mode routing |
@@ -334,9 +335,10 @@ All failures are logged with `log.exception`/`log.warning` context for debugging
   `data/config.json`, also gitignored). Never in the repo; the only Clerk value served to
   the frontend is the **publishable** key, which is public by design. `CLERK_SECRET_KEY`
   stays server-side.
-- **Upload validation** — extension allowlists (docs: PDF/DOCX/TXT/CSV/MD; sheets:
-  CSV/XLSX), size caps (50 MB docs, 20 MB sheets), filename sanitization, duplicate-name
-  handling, and parse-before-accept for spreadsheets.
+- **Upload validation** — extension allowlists (docs: PDF/DOCX/PPTX/ODT/RTF/HTML/JSON/
+  TXT/CSV/MD/LOG + images via OCR; sheets: CSV/XLSX), size caps (50 MB docs, 20 MB
+  sheets), filename sanitization, duplicate-name handling, and parse-before-accept for
+  spreadsheets.
 - **No arbitrary code execution** — calculator uses an AST allowlist (no `eval`); the
   pandas sandbox runs in a subprocess with a timeout and blocked imports/file I/O.
 - **Best-effort sandbox, by design** — a determined local user can escape a Python
@@ -409,7 +411,7 @@ python -m uvicorn server:app --host 127.0.0.1 --port 8000
 
 ```bash
 cd docchat
-python tests/run_all.py          # all 15 suites (143 tests)
+python tests/run_all.py          # all 16 suites (161 tests)
 python tests/test_agent.py       # agent loop with a scripted fake LLM — no network
 ```
 
@@ -441,6 +443,7 @@ docchat/
     registry.py       declarative tool registry (prompt + dispatcher derive from it)
     retrieval.py      hybrid retrieval (vector + BM25 + RRF) with fallbacks
     ingest.py         shared upload/attach ingestion (parse → chunk → embed → store)
+    ocr.py            local OCR fallback (RapidOCR + pypdfium2) for scans and images
     llm.py            Groq client: chat (stream/JSON), STT, TTS, fallback model, embeddings
     store.py          SQLite: chunks+embeddings, FTS5, memory, sessions, sheets (per-user)
     parsing.py        PDF/DOCX/TXT/CSV/MD extraction + chunking
@@ -482,7 +485,9 @@ The full rationale lives in [`docchat/README.md`](docchat/README.md). The short 
 
 ## Known limits
 
-- Scanned/image-only PDFs have no text layer → upload fails with a clear message (no OCR).
+- Scanned/image-only PDFs and images are read via local OCR (RapidOCR); very poor scans
+  (blank, skewed, low-quality) may still fail with a clear message. OCR is capped at 30
+  pages per document.
 - `qwen/qwen3.8-27b` is a Groq *preview* model — it may be retired on short notice; the
   `DEAD_MODELS` auto-migration + fallback chain are the designed mitigation.
 - Currency conversion uses a free keyless rate API (1-hour cache); when it is down the
@@ -498,7 +503,7 @@ The full rationale lives in [`docchat/README.md`](docchat/README.md). The short 
 
 ## Roadmap
 
-- [ ] Legacy-format parsing (.doc, .pptx, .odt) and OCR for scanned PDFs (RapidOCR)
+- [ ] Legacy binary formats (.doc, .xls) — the .doc path could use antiword/textract
 - [ ] PostgreSQL + pgvector backend (the retrieval layer is already isolated for this)
 - [ ] Cross-encoder reranker for higher retrieval precision
 - [ ] Per-user persistent storage on Render (paid disk) for true multi-user persistence
