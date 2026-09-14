@@ -18,7 +18,7 @@ verifies, and streams a grounded answer with citations.
 - **Works with any Groq chat model**; voice uses Groq Whisper (STT) + Groq Orpheus (TTS).
 - **Multi-user ready**: optional Clerk authentication with per-user workspace isolation,
   plus a guest mode and a legacy local mode — one database, scoped queries.
-- **108 tests across 11 suites**, all runnable offline.
+- **143 tests across 15 suites**, all runnable offline.
 
 The code lives in [`docchat/`](docchat/). [`docchat/README.md`](docchat/README.md) is the
 developer deep-dive (module layout, trade-offs, internals).
@@ -52,6 +52,7 @@ developer deep-dive (module layout, trade-offs, internals).
 |---|---|---|
 | **Text chat** | Streaming answers (SSE), markdown, tool-activity status | FastAPI, vanilla JS |
 | **Document RAG** | Upload PDF/DOCX/TXT/CSV/MD → parse → chunk → embed → hybrid retrieve → cite | pypdf, python-docx, fastembed |
+| **Attach & analyze (📎)** | Attach a file to any chat message — parsed and indexed instantly, the agent reads it first and answers with citations | shared ingest pipeline (`ragchat/ingest.py`) |
 | **Hybrid retrieval** | Vector cosine **+** FTS5 BM25, fused with **Reciprocal Rank Fusion**, relevance-gated | SQLite FTS5, numpy |
 | **Agentic RAG** | The agent decides *whether* to search, rewrites queries, re-searches when evidence is thin | JSON-mode routing |
 | **Visible planner** | Multi-step requests get a live "Jarvis's plan" checklist the agent works through and revises | plan-aware decision loop |
@@ -408,7 +409,7 @@ python -m uvicorn server:app --host 127.0.0.1 --port 8000
 
 ```bash
 cd docchat
-python tests/run_all.py          # all 14 suites (134 tests)
+python tests/run_all.py          # all 15 suites (143 tests)
 python tests/test_agent.py       # agent loop with a scripted fake LLM — no network
 ```
 
@@ -439,6 +440,7 @@ docchat/
     agent.py          the agent loop + self-RAG verification + tool handlers
     registry.py       declarative tool registry (prompt + dispatcher derive from it)
     retrieval.py      hybrid retrieval (vector + BM25 + RRF) with fallbacks
+    ingest.py         shared upload/attach ingestion (parse → chunk → embed → store)
     llm.py            Groq client: chat (stream/JSON), STT, TTS, fallback model, embeddings
     store.py          SQLite: chunks+embeddings, FTS5, memory, sessions, sheets (per-user)
     parsing.py        PDF/DOCX/TXT/CSV/MD extraction + chunking
@@ -496,6 +498,7 @@ The full rationale lives in [`docchat/README.md`](docchat/README.md). The short 
 
 ## Roadmap
 
+- [ ] Legacy-format parsing (.doc, .pptx, .odt) and OCR for scanned PDFs (RapidOCR)
 - [ ] PostgreSQL + pgvector backend (the retrieval layer is already isolated for this)
 - [ ] Cross-encoder reranker for higher retrieval precision
 - [ ] Per-user persistent storage on Render (paid disk) for true multi-user persistence

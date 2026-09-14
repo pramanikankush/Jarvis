@@ -43,6 +43,7 @@ AVAILABLE TOOLS — choose at most one per step; respond with ONLY a JSON object
   "tool_input": {{ ...arguments... }}
 }}
 
+- ATTACHED FILES: {attachments}
 - search_documents: {search_documents}
 - calculate: {calculate}
 - web_search: {web_search}
@@ -56,6 +57,12 @@ AVAILABLE TOOLS — choose at most one per step; respond with ONLY a JSON object
 - notes: {notes}
 - quiz_me: {quiz_me}
 - convert: {convert}
+
+ATTACHMENTS: when files are listed under ATTACHED FILES, the user attached them to THIS
+message — they want these files read and analyzed. Call search_documents FIRST (a query
+topical to the files and the question) before answering, and cite the results. If the
+question is only a greeting/small talk, acknowledge the files briefly and say what you
+can do with them instead of searching.
 
 PLANNING:
 - For anything that needs more than one quick action (multi-part questions, coding tasks, planning requests like "plan my day" or "help me build X", comparisons), include "plan": an array of 2-5 short steps you intend to take, in order.
@@ -173,8 +180,14 @@ class Agent:
         return bool(r)
 
     # ---------------- main entry ----------------
-    async def run(self, question: str, history: list[dict], session_id: str | None):
-        """Yield events: tool / status / sources / chart / token / memory / done."""
+    async def run(self, question: str, history: list[dict], session_id: str | None,
+                  attachments: list[dict] | None = None):
+        """Yield events: tool / status / sources / chart / token / memory / done.
+
+        `attachments` is a list of {id, name, chunks} documents attached to THIS
+        message (validated per-user by the server). They are announced in the
+        decision prompt so the agent searches them first.
+        """
         yield {"type": "status", "label": "Understanding request"}
         mem_block = memory.format_memory_block(
             memory.build_memory_context(self.store, session_id, question)) if session_id else ""
@@ -186,12 +199,18 @@ class Agent:
         current_step = 0
         self._web_cache = {}  # fresh dedup cache per turn
         self._url_cache = {}
+        attachments = attachments or []
+        attached_block = "\n".join(
+            f"- {a.get('name', 'file')} ({a.get('chunks', '?')} indexed sections)"
+            for a in attachments)
+        attachments_ctx = (attached_block if attached_block else
+                           "(no files attached to this message)")
 
         while steps < MAX_STEPS:
             steps += 1
             if await self._check_disconnect():
                 return
-            decision = await self._decide(question, history, mem_block, tool_log)
+            decision = await self._decide(question, history, mem_block, tool_log, attachments_ctx)
             if decision is None:
                 break  # model output unparseable -> answer with what we have
             new_plan = decision.get("plan")
@@ -259,9 +278,11 @@ class Agent:
         yield {"type": "memory", "message": "Memory updated"}
 
     # ---------------- decision step ----------------
-    async def _decide(self, question, history, mem_block, tool_log) -> dict | None:
+    async def _decide(self, question, history, mem_block, tool_log,
+                      attachments_ctx: str = "") -> dict | None:
         messages = self._messages(
-            SYSTEM_TPL.format(memory_block=mem_block, **TOOL_DOCS), history, question, tool_log)
+            SYSTEM_TPL.format(memory_block=mem_block, attachments=attachments_ctx,
+                              **TOOL_DOCS), history, question, tool_log)
         try:
             raw = await self.llm_chat(self.key, self.model, messages, json_mode=True,
                                       temperature=0.1, max_tokens=600)

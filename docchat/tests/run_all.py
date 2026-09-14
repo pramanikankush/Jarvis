@@ -8,7 +8,7 @@ sys.path.insert(0, ROOT)
 
 MODULES = ["test_check", "test_envfile", "test_retrieval", "test_tools", "test_spreadsheet",
            "test_memory", "test_websearch", "test_usagetrack", "test_agent", "test_auth",
-           "test_demo_limit", "test_planner", "test_toolkit", "test_migration"]
+           "test_demo_limit", "test_planner", "test_toolkit", "test_migration", "test_attach"]
 
 
 def main():

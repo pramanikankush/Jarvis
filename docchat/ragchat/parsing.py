@@ -104,6 +104,22 @@ def _parse_csv(data: bytes) -> str:
     return "\n".join(lines)
 
 
+def doc_stats(name: str) -> dict:
+    """A small, honest descriptor for UI chips: what the parser accepts for
+    this file type and how it is split. Page counts for PDFs come from the
+    stored chunks; everything else reports its splitting mode."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext == ".pdf":
+        return {"kind": "pdf", "split_by": "page"}
+    if ext == ".docx":
+        return {"kind": "word", "split_by": "document"}
+    if ext == ".csv":
+        return {"kind": "csv", "split_by": "rows"}
+    if ext in (".md", ".markdown"):
+        return {"kind": "markdown", "split_by": "document"}
+    return {"kind": "text", "split_by": "document"}
+
+
 def _is_numeric(s: str) -> bool:
     try:
         float(s.replace(",", ""))

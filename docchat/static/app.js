@@ -27,6 +27,8 @@ const state = {
   ttsEnabled: localStorage.getItem("jarvis_tts") === "1",
   recording: false,
   abortReason: null, // "user" (Stop pressed) | "timeout" (watchdog) | null
+  pendingFiles: [],  // files staged with 📎, uploaded on send
+  uploading: false,  // attachments are being indexed before the message sends
 };
 
 // hard ceiling for a single request; a hung backend becomes a visible error
@@ -531,13 +533,14 @@ async function openSession(id) {
 }
 
 /* ---------------- chat rendering ---------------- */
-function appendUserBubble(text) {
+function appendUserBubble(text, attachments = []) {
   const msg = document.createElement("div");
   msg.className = "msg user";
   const b = document.createElement("div");
   b.className = "bubble";
   b.textContent = text;
   msg.appendChild(b);
+  appendUserAttachChips(msg, attachments);
   $("#chat").appendChild(msg);
 }
 
@@ -679,10 +682,10 @@ function scrollToBottom(force = false) {
 }
 
 /* ---------------- streaming chat ---------------- */
-async function sendMessage(text) {
+async function sendMessage(text, attachments = []) {
   if (state.streaming) return;
   emptyEl.classList.add("hidden");
-  appendUserBubble(text);
+  appendUserBubble(text, attachments);
   inputEl.value = "";
   autoResize();
 
@@ -714,7 +717,7 @@ async function sendMessage(text) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers,
-      body: JSON.stringify({ session_id: state.current, message: text }),
+      body: JSON.stringify({ session_id: state.current, message: text, attachments }),
       signal: state.abort.signal,
     });
     if (!res.ok || !res.body) {
@@ -933,6 +936,85 @@ async function uploadFiles(files) {
   }
   note.classList.add("hidden");
   if (ok) toast(`Indexed ${ok} file${ok > 1 ? "s" : ""} ✓`, "ok");
+}
+
+/* ---------------- chat attachments (📎) ---------------- */
+const ATTACH_EXTS = [".pdf", ".docx", ".txt", ".md", ".markdown", ".csv"];
+const attachChipsEl = $("#attach-chips");
+
+function stageAttachFiles(files) {
+  for (const f of files) {
+    const ext = "." + (f.name.split(".").pop() || "").toLowerCase();
+    if (!ATTACH_EXTS.includes(ext)) {
+      toast(`${f.name}: unsupported type — ${ATTACH_EXTS.join(", ")} only`, "err");
+      continue;
+    }
+    if (f.size > 50 * 1024 * 1024) {
+      toast(`${f.name}: too large (max 50 MB)`, "err");
+      continue;
+    }
+    if (state.pendingFiles.some((p) => p.name === f.name && p.size === f.size)) continue;
+    state.pendingFiles.push(f);
+  }
+  renderAttachChips();
+}
+
+function renderAttachChips() {
+  attachChipsEl.innerHTML = "";
+  attachChipsEl.classList.toggle("hidden", state.pendingFiles.length === 0);
+  state.pendingFiles.forEach((f, i) => {
+    const chip = document.createElement("span");
+    chip.className = "attach-chip";
+    const kb = f.size > 1024 * 1024 ? `${(f.size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(f.size / 1024))} KB`;
+    chip.innerHTML = `📄 ${f.name.replace(/</g, "&lt;")} <small>${kb}</small>`;
+    const x = document.createElement("button");
+    x.className = "attach-x";
+    x.title = "Remove";
+    x.textContent = "✕";
+    x.addEventListener("click", () => { state.pendingFiles.splice(i, 1); renderAttachChips(); });
+    chip.appendChild(x);
+    attachChipsEl.appendChild(chip);
+  });
+}
+
+async function uploadAttachments() {
+  // Upload the staged 📎 files; returns prompt-ready attachment rows. Files
+  // that fail to index are reported but never block the message from sending.
+  const out = [];
+  if (!state.pendingFiles.length) return out;
+  const note = $("#indexing-note");
+  note.classList.remove("hidden");
+  note.textContent = "Reading attachment…";
+  for (const file of state.pendingFiles) {
+    const fd = new FormData();
+    fd.append("file", file);
+    try {
+      const data = await api("/api/attach", { method: "POST", body: fd });
+      out.push({ id: data.doc.id, name: data.doc.name });
+      state.docs = data.docs;
+      renderDocs();
+      updateStat();
+    } catch (err) {
+      toast(`${file.name}: ${err.message}`, "err");
+    }
+  }
+  note.classList.add("hidden");
+  state.pendingFiles = [];
+  renderAttachChips();
+  return out;
+}
+
+function appendUserAttachChips(msgEl, attachments) {
+  if (!attachments || !attachments.length) return;
+  const wrap = document.createElement("div");
+  wrap.className = "msg-att-chips";
+  for (const a of attachments) {
+    const chip = document.createElement("span");
+    chip.className = "attach-chip sent";
+    chip.innerHTML = `📄 ${(a.name || "file").replace(/</g, "&lt;")}`;
+    wrap.appendChild(chip);
+  }
+  msgEl.appendChild(wrap);
 }
 
 function updateStat() {
@@ -1279,10 +1361,22 @@ async function refreshQuota() {
 }
 
 /* ---------------- events ---------------- */
-sendBtn.addEventListener("click", () => {
+sendBtn.addEventListener("click", async () => {
   if (state.streaming) { state.abortReason = "user"; state.abort.abort(); return; }
-  const text = inputEl.value.trim();
-  if (text) sendMessage(text.slice(0, 4000));
+  if (state.uploading) return;
+  const text = inputEl.value.trim().slice(0, 4000);
+  const hasPending = state.pendingFiles.length > 0;
+  if (!text && !hasPending) return;
+  state.uploading = true;
+  let atts = [];
+  try {
+    atts = await uploadAttachments();
+  } finally {
+    state.uploading = false;
+  }
+  // attachment-only send: give the agent something to analyze
+  const message = text || (atts.length ? `Please read and summarize the attached file${atts.length > 1 ? "s" : ""}.` : "");
+  if (message) sendMessage(message, atts);
 });
 
 inputEl.addEventListener("keydown", (e) => {
@@ -1299,6 +1393,13 @@ function autoResize() {
 inputEl.addEventListener("input", autoResize);
 
 micBtn.addEventListener("click", toggleMic);
+
+// chat attachments (📎)
+$("#btn-attach").addEventListener("click", () => $("#attach-input").click());
+$("#attach-input").addEventListener("change", (e) => {
+  stageAttachFiles([...e.target.files]);
+  e.target.value = "";
+});
 
 // doc upload
 const dropzone = $("#dropzone");

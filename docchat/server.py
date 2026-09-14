@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from ragchat import agent as agent_mod  # noqa: E402
-from ragchat import auth, llm, parsing, spreadsheet, store, usagetrack, websearch  # noqa: E402
+from ragchat import auth, ingest, llm, parsing, spreadsheet, store, usagetrack, websearch  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("jarvis.server")
@@ -230,25 +230,13 @@ async def upload_doc(request: Request):
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, f"File too large (max {MAX_FILE_BYTES // (1024 * 1024)} MB)")
     try:
-        pages = await asyncio.to_thread(parsing.parse, name, data)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    chunks = [(page, c) for page, text in pages for c in parsing.chunk_text(text)]
-    if not chunks:
-        raise HTTPException(400, "No extractable text found in this file")
-    try:
-        vecs = await asyncio.to_thread(llm.embed_texts, [c for _, c in chunks])
-    except Exception as e:
+        doc, _chunks = await ingest.ingest_doc(db, name, data)
+    except ingest.EmbedError as e:
         raise HTTPException(
             503, f"Embedding model failed to start: {e} (first run downloads ~100 MB; needs internet)"
         )
-    existing = {d["name"] for d in db.list_docs()}
-    base, ext = os.path.splitext(name)
-    i = 2
-    while name in existing:
-        name = f"{base} ({i}){ext}"
-        i += 1
-    doc = await asyncio.to_thread(db.add_doc, name, len(data), chunks, list(vecs))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return JSONResponse({"ok": True, "doc": doc, "docs": db.list_docs()})
 
 
@@ -258,6 +246,37 @@ async def delete_doc(doc_id: int, request: Request):
     if not db.delete_doc(doc_id):
         raise HTTPException(404, "Document not found")
     return {"ok": True, "docs": db.list_docs()}
+
+
+@app.post("/api/attach")
+async def attach_doc(request: Request):
+    """Attach a document to the current chat message: same ingestion pipeline
+    as the sidebar upload (parse -> chunk -> embed -> store), so the file is
+    immediately searchable by the agent — plus parse stats for the UI chip."""
+    db = scoped(request)
+    form = await request.form()
+    up = form.get("file")
+    if not up or not up.filename:
+        raise HTTPException(400, "No file received")
+    name = os.path.basename(str(up.filename).replace("\\", "/"))
+    if not name:
+        raise HTTPException(400, "Empty filename")
+    data = await up.read()
+    if not data:
+        raise HTTPException(400, "The attached file is empty")
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, f"File too large (max {MAX_FILE_BYTES // (1024 * 1024)} MB)")
+    try:
+        doc, chunk_count = await ingest.ingest_doc(db, name, data)
+    except ingest.EmbedError as e:
+        raise HTTPException(
+            503, f"Embedding model failed to start: {e} (first run downloads ~100 MB; needs internet)"
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    stats = parsing.doc_stats(doc["name"])
+    return JSONResponse({"ok": True, "doc": doc, "chunks": chunk_count,
+                         "stats": stats, "docs": db.list_docs()})
 
 
 # ---------------- spreadsheets ----------------
@@ -532,6 +551,7 @@ async def chat(request: Request):
     if not question:
         raise HTTPException(400, "Empty question")
     sid = body.get("session_id") or None
+    attachments = ingest.resolve_attachments(DB.for_user(identity(request).uid), body.get("attachments"))
     user = identity(request)
     db = DB.for_user(user.uid)
 
@@ -574,7 +594,8 @@ async def chat(request: Request):
             )
             answer, sources = "", []
             saw_done = False
-            async for evt in a.run(question, history, session_id):
+            async for evt in a.run(question, history, session_id,
+                                   attachments=attachments):
                 if evt["type"] == "done":
                     saw_done = True
                     answer, sources = evt.get("answer", ""), evt.get("sources") or []

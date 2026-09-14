@@ -5,8 +5,9 @@ A single-agent personal assistant that answers from **your documents (RAG)**, an
 > **2026-09 update:** migrated to the live 2026 Groq lineup (default `qwen/qwen3.8-27b`,
 > fallback `openai/gpt-oss-120b` — the original default was decommissioned 2026-08-16),
 > added a visible multi-step planner and an everyday toolkit (tasks, notes, document
-> quizzes, unit/currency conversion, URL reading, free keyless image generation).
-> Test suite: 14 modules / 134 tests, all offline.
+> quizzes, unit/currency conversion, URL reading, free keyless image generation),
+> and chat attachments (📎) — attach a file to any message and the agent reads it first.
+> Test suite: 15 modules / 143 tests, all offline.
 
 - **100% local** except the Groq API (your key): embeddings and storage run on this machine.
 - One agent loop, no multi-agent machinery, no microservices.
@@ -23,6 +24,7 @@ A single-agent personal assistant that answers from **your documents (RAG)**, an
 | RAG | Upload PDF/DOCX/TXT/CSV/MD → parse → chunk → embed (local `bge-small-en-v1.5`) |
 | Hybrid search | Vector cosine + SQLite FTS5 BM25, fused with **Reciprocal Rank Fusion** |
 | Agentic RAG | The agent decides *whether* to search, rewrites queries, searches again if needed; low-confidence document matches carry a deterministic signal that steers the model to web search |
+| Chat attachments (📎) | Attach PDF/DOCX/TXT/MD/CSV to any message — parsed and indexed via the shared ingest pipeline, announced in the decision prompt, so the agent searches the attachment first and cites it |
 | Self-RAG | Verifies: sources relevant? answer cites them? answer supported? → corrects once, bounded |
 | Spreadsheet | .csv / .xlsx via pandas: columns, stats, groupby, filters, anomaly detection, charts |
 | Tools | Safe calculator (AST allowlist), web search (Tavily + `ddgs` fallback), sandboxed pandas execution |
@@ -136,6 +138,7 @@ ragchat/
   agent.py        the agent loop + self-RAG verification + tool handlers
   registry.py     declarative tool registry (tool list + dispatcher derive from it)
   retrieval.py    hybrid retrieval (vector + BM25 + RRF) with fallbacks
+  ingest.py       shared upload/attach ingestion (parse → chunk → embed → store)
   llm.py          Groq client: chat (stream/JSON), STT, TTS, fallback model
   store.py        SQLite: chunks+embeddings, FTS5, memory, sessions, sheets
   parsing.py      PDF/DOCX/TXT/CSV/MD extraction + chunking
@@ -160,8 +163,10 @@ Tests cover: chunking/parsing, store+FTS, RRF fusion and fallbacks, the
 calculator allowlist, the sandbox, spreadsheet ops + charts, memory
 extraction/dedupe, the web-search provider (Tavily request format, fallback,
 failures, key never leaked), the usage tracker (record/sync/rollover/corrupt
-file), and the agent loop (routing, RAG citations, self-RAG correction,
-tool-error fallback, tool-log visibility, duplicate-search suppression).
+file), the agent loop (routing, RAG citations, self-RAG correction,
+tool-error fallback, tool-log visibility, duplicate-search suppression), and
+chat attachments (ingest pipeline, per-user attachment validation, the
+agent's ATTACHED FILES prompt behavior).
 
 ## Notes & limits
 

@@ -160,7 +160,17 @@
     </div>
 
     <div id="composer" class="composer">
+      <div id="attach-chips" class="attach-chips hidden"></div>
       <div class="composer-box">
+        <button id="btn-attach" class="mic-btn attach-btn" title="Attach a document — it is analyzed with your next message"
+                aria-label="Attach document">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M13.4 7.3 7.9 12.8a3.4 3.4 0 0 1-4.8-4.8L8.6 2.5a2.3 2.3 0 0 1 3.2 3.2L6.3 11.2a1.15 1.15 0 0 1-1.6-1.6l4.9-4.9"
+                  stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <input type="file" id="attach-input" multiple hidden
+               accept=".pdf,.docx,.txt,.md,.markdown,.csv">
         <button id="btn-mic" class="mic-btn" title="Voice input — click to start/stop recording" aria-label="Voice input">
           <svg width="15" height="16" viewBox="0 0 15 16" fill="none" aria-hidden="true">
             <rect x="4.5" y="1" width="6" height="9.5" rx="3" stroke="currentColor" stroke-width="1.4"/>
@@ -175,7 +185,7 @@
           </svg>
         </button>
       </div>
-      <div class="composer-hint">Documents · spreadsheets · web · math · tasks · notes · quizzes · conversions · images.</div>
+      <div class="composer-hint">📎 Attach a file with any message · documents · spreadsheets · web · math · tasks · notes · quizzes · conversions · images.</div>
     </div>
   </main>
 </div>
