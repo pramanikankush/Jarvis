@@ -34,7 +34,7 @@ DEMO_MAX_CHATS = int(os.environ.get("DEMO_MAX_CHATS", "3") or "0")
 
 DB = store.Store()
 _config = {"groq_key": "", "model": llm.DEFAULT_MODEL, "tts_voice": llm.TTS_VOICE,
-           "tavily_key": ""}
+           "tavily_key": "", "images_enabled": True}
 
 
 def load_config():
@@ -44,8 +44,13 @@ def load_config():
         for k in ("groq_key", "model", "tts_voice", "tavily_key"):
             if k in saved and saved[k]:
                 _config[k] = saved[k]
+        if "images_enabled" in saved:
+            _config["images_enabled"] = bool(saved["images_enabled"])
     except (FileNotFoundError, ValueError):
         pass
+    # Groq decommissions model IDs over time (llama-3.3/3.1 died 2026-08-16);
+    # a stale saved model must never be able to select a dead model.
+    _config["model"] = llm.migrate_model(_config["model"])
     env_key = os.environ.get("GROQ_API_KEY")
     if env_key:  # environment variable always wins (docker/CI friendly)
         _config["groq_key"] = env_key
@@ -158,6 +163,9 @@ async def api_state(request: Request):
         "sessions": db.list_sessions(),
         "sheets": db.list_sheets(),
         "memory_count": len(db.list_memory()),
+        "open_tasks": len(db.list_tasks(include_done=False)),
+        "note_count": len(db.list_notes()),
+        "images_enabled": _config.get("images_enabled", True),
         "demo_max_chats": DEMO_MAX_CHATS if identity(request).uid else 0,
     }
 
@@ -185,14 +193,16 @@ async def post_config(request: Request):
     if "tavily_key" in body:
         _config["tavily_key"] = (body.get("tavily_key") or "").strip()
     if body.get("model"):
-        _config["model"] = str(body["model"]).strip()
+        _config["model"] = llm.migrate_model(str(body["model"]).strip())
+    if "images_enabled" in body:
+        _config["images_enabled"] = bool(body["images_enabled"])
     if body.get("tts_voice") in llm.TTS_VOICES:
         _config["tts_voice"] = str(body["tts_voice"]).strip()
     save_config()
     load_config()  # re-applies env overrides (GROQ_API_KEY / TAVILY_API_KEY) on top of file
     return {"ok": True, "key_set": bool(_config["groq_key"]), "model": _config["model"],
-            "tts_voice": _config["tts_voice"],
-            "tavily_set": bool(_config.get("tavily_key"))}
+            "tts_voice": _config["tts_voice"], "tavily_set": bool(_config.get("tavily_key")),
+            "images_enabled": bool(_config.get("images_enabled", True))}
 
 
 @app.get("/api/models")
@@ -357,6 +367,70 @@ async def tts(request: Request):
     return Response(content=audio, media_type="audio/wav")
 
 
+# ---------------- tasks / notes (everyday toolkit) ----------------
+@app.get("/api/tasks")
+async def get_tasks(request: Request):
+    return {"tasks": scoped(request).list_tasks()}
+
+
+@app.post("/api/tasks")
+async def post_task(request: Request):
+    db = scoped(request)
+    body = await json_body(request)
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "Empty task text")
+    due = (str(body.get("due") or "").strip() or None)
+    row = db.add_task(text, due)
+    if not row.get("id"):
+        raise HTTPException(400, "Could not add task")
+    return {"ok": True, "task": row, "tasks": db.list_tasks()}
+
+
+@app.patch("/api/tasks/{tid}")
+async def patch_task(tid: int, request: Request):
+    db = scoped(request)
+    body = await json_body(request)
+    done = bool(body.get("done", True))
+    if not db.set_task_done(tid, done):
+        raise HTTPException(404, "Task not found")
+    return {"ok": True, "tasks": db.list_tasks()}
+
+
+@app.delete("/api/tasks/{tid}")
+async def delete_task(tid: int, request: Request):
+    db = scoped(request)
+    if not db.delete_task(tid):
+        raise HTTPException(404, "Task not found")
+    return {"ok": True, "tasks": db.list_tasks()}
+
+
+@app.get("/api/notes")
+async def get_notes(request: Request, q: str = ""):
+    return {"notes": scoped(request).list_notes(q)}
+
+
+@app.post("/api/notes")
+async def post_note(request: Request):
+    db = scoped(request)
+    body = await json_body(request)
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "Empty note text")
+    row = db.add_note(text)
+    if not row.get("id"):
+        raise HTTPException(400, "Could not add note")
+    return {"ok": True, "note": row, "notes": db.list_notes()}
+
+
+@app.delete("/api/notes/{nid}")
+async def delete_note(nid: int, request: Request):
+    db = scoped(request)
+    if not db.delete_note(nid):
+        raise HTTPException(404, "Note not found")
+    return {"ok": True, "notes": db.list_notes()}
+
+
 # ---------------- memory ----------------
 @app.get("/api/memory")
 async def get_memory(request: Request):
@@ -496,6 +570,7 @@ async def chat(request: Request):
                 get_sheet_path=lambda s: sheet_path(s, user.uid),
                 is_disconnected=lambda: request.is_disconnected(),
                 uid=user.uid,
+                images_enabled=bool(_config.get("images_enabled", True)),
             )
             answer, sources = "", []
             saw_done = False
@@ -509,6 +584,10 @@ async def chat(request: Request):
                     yield sse({"type": "tool", "tool": evt["tool"], "args": evt.get("args") or {}})
                 elif evt["type"] == "chart":
                     yield sse({"type": "chart", "url": evt["url"]})
+                elif evt["type"] == "image":
+                    yield sse({"type": "image", "url": evt["url"]})
+                elif evt["type"] == "plan":
+                    yield sse({"type": "plan", "plan": evt["plan"], "step": evt.get("step", 0)})
                 elif evt["type"] == "sources":
                     yield sse({"type": "sources", "sources": evt["sources"]})
                 elif evt["type"] == "status":

@@ -54,6 +54,11 @@ developer deep-dive (module layout, trade-offs, internals).
 | **Document RAG** | Upload PDF/DOCX/TXT/CSV/MD → parse → chunk → embed → hybrid retrieve → cite | pypdf, python-docx, fastembed |
 | **Hybrid retrieval** | Vector cosine **+** FTS5 BM25, fused with **Reciprocal Rank Fusion**, relevance-gated | SQLite FTS5, numpy |
 | **Agentic RAG** | The agent decides *whether* to search, rewrites queries, re-searches when evidence is thin | JSON-mode routing |
+| **Visible planner** | Multi-step requests get a live "Jarvis's plan" checklist the agent works through and revises | plan-aware decision loop |
+| **Everyday toolkit** | Tasks (to-dos with due dates), quick notes, unit/currency conversion — per-user, in the sidebar | SQLite + registry tools |
+| **Study mode** | "Quiz me on my documents" — generates a quiz from retrieved passages and grades your answers | retrieval + one LLM call |
+| **URL reading** | Paste a link → Jarvis fetches the page and extracts/summarizes the readable text | httpx + stdlib HTML strip |
+| **Image generation** | "Make me an image of…" — free, keyless (Pollinations.ai), disable in Settings | external image URL service |
 | **Self-RAG verification** | Sources relevant? answer cites them? supported? → one bounded correction, then stream | LLM judge |
 | **Citations** | `[n]` inline, clickable source list with document name + page number; never fabricated | — |
 | **Spreadsheet agent** | CSV/XLSX: column inspection, stats, groupby, filters, anomaly detection, charts | pandas, matplotlib, openpyxl |
@@ -111,6 +116,7 @@ All configuration is via environment variables. Create `docchat/.env` from
 | Variable | Default | Meaning |
 |---|---|---|
 | `GROQ_API_KEY` | — | Groq LLM key; overrides the key saved via the Settings UI |
+| `GROQ_MODEL` | `qwen/qwen3.8-27b` | Default chat model (2026 Groq lineup) |
 | `TAVILY_API_KEY` | — | Web search provider (optional; DuckDuckGo fallback when unset) |
 | `CLERK_PUBLISHABLE_KEY` | — | Clerk publishable key — enables auth (public by design) |
 | `CLERK_SECRET_KEY` | — | Clerk secret key (server-side only; fallback token verifier) |
@@ -137,19 +143,24 @@ Frontend (vanilla JS, /app)
 FastAPI (server.py) ── identity: Clerk JWT > guest UUID > local
    │
    ▼
-Agent (ragchat/agent.py)  ─ one loop: decide → act → observe → verify → answer
+Agent (ragchat/agent.py)  ─ one loop: plan → decide → act → observe → verify → answer
    │
    ├── search_documents     → retrieval.py  (vector + BM25 + RRF + confidence signal)
    ├── calculate            → tools.py      (AST allowlist)
    ├── web_search           → websearch.py  (Tavily → DuckDuckGo fallback, per-turn dedup)
+   ├── summarize_url        → tools.py      (fetch + readable-text extraction)
+   ├── generate_image       → tools.py      (free keyless Pollinations URL; toggle in Settings)
    ├── analyze_spreadsheet  → spreadsheet.py (pandas: info/stats/groupby/filter/anomalies/chart)
    ├── run_python           → tools.py      (restricted subprocess sandbox)
    ├── memory               → store.py      (list/add/update/forget/delete + extraction)
+   ├── tasks / notes        → store.py      (per-user everyday to-dos + notes)
+   ├── quiz_me              → retrieval + one LLM call (study mode)
+   ├── convert              → tools.py      (units/temperature stdlib; currency via free keyless API)
    └── time                 → UTC clock     (current-information decisions)
    │
    └── Self-RAG verify      → relevance/support judge + bounded correction
    │
-Store: SQLite data/app.db — chunks + embeddings, FTS5, memory, sessions, sheets (per user_id)
+Store: SQLite data/app.db — chunks + embeddings, FTS5, memory, sessions, sheets, tasks, notes (per user_id)
 Voice: llm.py → Groq /audio/transcriptions + /audio/speech
 ```
 
@@ -167,7 +178,9 @@ Every message runs through the same loop (bounded, `MAX_STEPS = 5`):
 User message
    │
    ▼
-1. DECIDE   — LLM returns JSON: {thought, tool, tool_input}   (JSON-mode; works on every Groq model)
+1. DECIDE   — LLM returns JSON: {thought, plan?, tool, tool_input}   (JSON-mode; works on every Groq model)
+   │            multi-step requests include "plan": 2–5 visible steps, worked one per decision,
+   │            revised when results contradict it, rendered live in the UI as a checklist
    │
    ▼
 2. ACT      — run the chosen tool, stream a "tool" status event, append the observation
@@ -395,7 +408,7 @@ python -m uvicorn server:app --host 127.0.0.1 --port 8000
 
 ```bash
 cd docchat
-python tests/run_all.py          # all 11 suites (108 tests)
+python tests/run_all.py          # all 14 suites (134 tests)
 python tests/test_agent.py       # agent loop with a scripted fake LLM — no network
 ```
 
@@ -403,8 +416,11 @@ Coverage: parsing/chunking, store + FTS, RRF fusion and fallbacks, calculator al
 sandbox, spreadsheet ops + charts, memory extraction/dedupe, web-search provider (request
 format, fallback, failures, key never leaked), usage tracker (record/sync/rollover/corrupt
 file), auth (Clerk JWT + guest + local + degradation), demo chat limit (cap, exempt local,
-delete frees slot, disable, per-user isolation), and the agent loop (routing, RAG citations,
-self-RAG correction, tool-error fallback, duplicate-search suppression).
+delete frees slot, disable, per-user isolation), the agent loop (routing, RAG citations,
+self-RAG correction, tool-error fallback, duplicate-search suppression), the multi-step
+planner (plan events, step tracking, replanning, legacy-model degradation), the everyday
+toolkit (tasks/notes CRUD + scoping, converter, image toggle, quiz), and the 2026 model
+migration (dead-model auto-mapping, fallback chain, per-model usage limits).
 
 ---
 
@@ -445,6 +461,10 @@ The full rationale lives in [`docchat/README.md`](docchat/README.md). The short 
 
 1. **SQLite + FTS5 instead of PostgreSQL + pgvector** — BM25 + vector cosine with zero
    extra services; retrieval is isolated in `retrieval.py` so a pgvector swap is contained.
+1b. **Model IDs decay; the app shouldn't.** Groq decommissioned the original default model
+   (llama-3.3-70b-versatile, 2026-08-16). The default is now `qwen/qwen3.8-27b` with
+   `openai/gpt-oss-120b` as the automatic fallback, and a `DEAD_MODELS` set auto-migrates
+   any stale saved config so an old `config.json` can never select a decommissioned model.
 2. **Hand-rolled agent loop instead of LangGraph** — a linear `decide → act → observe →
    verify → answer` state machine; one LLM call per step; unit-tested with a fake LLM.
 3. **JSON-mode tool routing instead of native tool-calling** — one code path that works
@@ -461,6 +481,12 @@ The full rationale lives in [`docchat/README.md`](docchat/README.md). The short 
 ## Known limits
 
 - Scanned/image-only PDFs have no text layer → upload fails with a clear message (no OCR).
+- `qwen/qwen3.8-27b` is a Groq *preview* model — it may be retired on short notice; the
+  `DEAD_MODELS` auto-migration + fallback chain are the designed mitigation.
+- Currency conversion uses a free keyless rate API (1-hour cache); when it is down the
+  agent says so and suggests web search.
+- Image generation (Pollinations.ai) is free and keyless but best-effort; failures degrade
+  to text-only answers, and the tool can be disabled in Settings.
 - Files > 50 MB rejected; very large files truncated at ~300k chars.
 - Local Groq embedding downloads (~100 MB) on first run — requires internet once.
 - Free-tier hosting resets data on redeploy (ephemeral disk) — see [Deployment](#deployment).

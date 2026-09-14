@@ -206,7 +206,11 @@ def chart(df, chart_type: str, column: str, group: str | None = None, limit: int
             plt.xticks(rotation=45, ha="right")
         elif chart_type == "box":
             cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])][:8]
-            ax.boxplot([df[c].dropna() for c in cols], labels=[str(c) for c in cols])
+            # matplotlib >= 3.9 renamed `labels` to `tick_labels`
+            try:
+                ax.boxplot([df[c].dropna() for c in cols], tick_labels=[str(c) for c in cols])
+            except TypeError:  # matplotlib < 3.9
+                ax.boxplot([df[c].dropna() for c in cols], labels=[str(c) for c in cols])
             ax.set_title("Box plot")
             plt.xticks(rotation=45, ha="right")
         else:  # bar

@@ -77,6 +77,20 @@ CREATE TABLE IF NOT EXISTS sheets (
     cols INTEGER NOT NULL DEFAULT 0,
     uploaded_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0,
+    due TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_memory_fact ON memory(fact);
@@ -141,7 +155,8 @@ class Store:
             if "pinned" not in cols:
                 self._conn.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
             for table, col in (("docs", "user_id"), ("sessions", "user_id"),
-                               ("memory", "user_id"), ("sheets", "user_id")):
+                               ("memory", "user_id"), ("sheets", "user_id"),
+                               ("tasks", "user_id"), ("notes", "user_id")):
                 tcols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
                 if col not in tcols:
                     self._conn.execute(
@@ -149,7 +164,7 @@ class Store:
                     )
             # user_id indexes live here (not in SCHEMA) so old databases get
             # them only after the column has been added
-            for table in ("docs", "sessions", "memory", "sheets"):
+            for table in ("docs", "sessions", "memory", "sheets", "tasks", "notes"):
                 self._conn.execute(
                     f"CREATE INDEX IF NOT EXISTS idx_{table}_user ON {table}(user_id)"
                 )
@@ -368,6 +383,86 @@ class Store:
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM sheets WHERE id=? AND user_id=?", (sid, self._uid)
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    # ---------------- tasks (per-user everyday to-do list) ----------------
+    def add_task(self, text: str, due: str | None = None) -> dict:
+        """Insert a task. `due` is a free-form string ("2026-09-20", "friday").
+        Empty text returns a sentinel dict (never raises)."""
+        text = (text or "").strip()
+        if not text:
+            return {"id": 0, "text": "", "done": False, "due": None}
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO tasks(user_id, text, done, due, created_at) VALUES(?,?,0,?,?)",
+                (self._uid, text[:500], due, time.strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            self._conn.commit()
+            tid = cur.lastrowid
+        return {"id": tid, "text": text, "done": False, "due": due}
+
+    def list_tasks(self, include_done: bool = True) -> list[dict]:
+        """Open tasks first, then completed; id order within each group."""
+        rows = self._conn.execute(
+            "SELECT id, text, done, due, created_at FROM tasks WHERE user_id=? "
+            + ("" if include_done else "AND done=0 ")
+            + "ORDER BY done, id",
+            (self._uid,),
+        ).fetchall()
+        return [{"id": r["id"], "text": r["text"], "done": bool(r["done"]),
+                 "due": r["due"], "created_at": r["created_at"]} for r in rows]
+
+    def set_task_done(self, tid: int, done: bool = True) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE tasks SET done=? WHERE id=? AND user_id=?", (1 if done else 0, tid, self._uid)
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    def delete_task(self, tid: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM tasks WHERE id=? AND user_id=?", (tid, self._uid)
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    # ---------------- notes (per-user quick notes) ----------------
+    def add_note(self, text: str) -> dict:
+        text = (text or "").strip()
+        if not text:
+            return {"id": 0, "text": ""}
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO notes(user_id, text, created_at) VALUES(?,?,?)",
+                (self._uid, text[:2000], time.strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            self._conn.commit()
+            nid = cur.lastrowid
+        return {"id": nid, "text": text}
+
+    def list_notes(self, q: str = "", limit: int = 100) -> list[dict]:
+        """Newest first; optional case-insensitive substring filter on text."""
+        if q.strip():
+            rows = self._conn.execute(
+                "SELECT id, text, created_at FROM notes WHERE user_id=? AND text LIKE ? "
+                "ORDER BY id DESC LIMIT ?",
+                (self._uid, f"%{q.strip()}%", limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, text, created_at FROM notes WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                (self._uid, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_note(self, nid: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM notes WHERE id=? AND user_id=?", (nid, self._uid)
             )
             self._conn.commit()
             return bool(cur.rowcount)

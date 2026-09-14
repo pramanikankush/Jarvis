@@ -43,6 +43,11 @@ KNOWN_TPD = {
     "llama3-8b-8192": 500_000,
     "mixtral-8x7b-32768": 500_000,
     "gemma2-9b-it": 500_000,
+    "qwen/qwen3.8-27b": 250_000,
+    "qwen/qwen3.6-27b": 250_000,
+    "openai/gpt-oss-120b": 250_000,
+    "openai/gpt-oss-20b": 250_000,
+    "groq/compound-mini": 100_000,
 }
 
 # RLock (not Lock): record/sync_429 acquire it and then call _current(),

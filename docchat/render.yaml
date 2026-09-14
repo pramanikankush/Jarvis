@@ -1,0 +1,21 @@
+# Render blueprint — deploy Jarvis with the Docker path (embedding model
+# pre-cached at build time). Env values are pasted in the Render dashboard,
+# never committed (sync: false).
+services:
+  - type: web
+    name: jarvis
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /api/state
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
+      - key: CLERK_SECRET_KEY
+        sync: false
+      - key: DEMO_MAX_CHATS
+        sync: false

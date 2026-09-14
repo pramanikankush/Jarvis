@@ -9,5 +9,5 @@ pyjwt              # Clerk session JWT verification (ragchat/auth.py)
 cryptography       # JWKS key loading for PyJWT (ragchat/auth.py)
 pandas             # spreadsheet analysis
 openpyxl           # .xlsx support for pandas
-matplotlib         # charts (headless Agg backend)
+matplotlib>=3.9     # charts (headless Agg backend; 3.9+ for boxplot tick_labels)
 ddgs               # free keyless web search (DuckDuckGo)

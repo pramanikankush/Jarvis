@@ -60,6 +60,30 @@
 
       <section>
         <div class="section-head">
+          <span>Tasks</span>
+          <button id="btn-add-task" class="mini-btn" title="Add task">＋</button>
+        </div>
+        <div class="mem-add-row">
+          <input type="text" id="task-input" class="mem-input" placeholder="Add a task… (e.g. 'pay rent friday')" aria-label="Add task">
+          <button id="btn-task-add" class="mini-btn" title="Save task">＋</button>
+        </div>
+        <ul id="tasks-list" class="docs-list"></ul>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <span>Notes</span>
+          <button id="btn-add-note" class="mini-btn" title="Add note">＋</button>
+        </div>
+        <div class="mem-add-row">
+          <input type="text" id="note-input" class="mem-input" placeholder="Add a note… (e.g. 'wifi password is…')" aria-label="Add note">
+          <button id="btn-note-add" class="mini-btn" title="Save note">＋</button>
+        </div>
+        <ul id="notes-list" class="docs-list"></ul>
+      </section>
+
+      <section>
+        <div class="section-head">
           <span>Chats<span id="chat-limit" class="chat-limit hidden"></span></span>
           <button id="btn-new" class="mini-btn" title="New chat" aria-label="New chat">
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
@@ -119,8 +143,12 @@
         <p>Ask me anything — your documents, spreadsheets, the web, or quick math. Voice input is supported via the mic button.</p>
         <div class="chips">
           <button class="chip" data-q="What can you do?">What can you do?</button>
+          <button class="chip" data-q="Plan my day: I have a morning study session, a workout, and 2 hours of project work">Plan my day</button>
+          <button class="chip" data-q="Quiz me on my uploaded documents">Quiz me on my documents</button>
           <button class="chip" data-q="Summarize my uploaded documents">Summarize my documents</button>
           <button class="chip" data-q="Analyze my spreadsheet: give me an overview of the data">Analyze my spreadsheet</button>
+          <button class="chip" data-q="Convert 100 USD to EUR and 5 km to miles">Convert units & currency</button>
+          <button class="chip" data-q="Generate an image of a friendly robot butler serving tea">Generate an image</button>
           <button class="chip" data-q="Calculate 17% of 2350">Calculate something</button>
         </div>
       </div>
@@ -147,7 +175,7 @@
           </svg>
         </button>
       </div>
-      <div class="composer-hint">I can search your documents, analyze spreadsheets, and browse the web.</div>
+      <div class="composer-hint">Documents · spreadsheets · web · math · tasks · notes · quizzes · conversions · images.</div>
     </div>
   </main>
 </div>
@@ -190,6 +218,15 @@
     </div>
     <select id="voice-select"></select>
     <div id="voice-status" class="key-status"></div>
+
+    <div class="settings-row">
+      <label class="field-label" style="flex:1">Image generation</label>
+      <label class="toggle">
+        <input type="checkbox" id="img-toggle">
+        <span>Allow image tool</span>
+      </label>
+    </div>
+    <div id="img-status" class="key-status"></div>
 
     <p class="modal-note">
       Your keys are stored only on this machine (<code>data/config.json</code>) and sent only to

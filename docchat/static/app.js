@@ -13,6 +13,9 @@ const state = {
   sheets: [],
   sessions: [],
   memory: [],
+  tasks: [],
+  notes: [],
+  images: true,
   current: null, // session id
   streaming: false,
   abort: null,
@@ -253,6 +256,140 @@ async function addMemoryFact() {
   } catch (err) { toast(err.message, "err"); }
 }
 
+/* ---------------- tasks + notes sidebar (everyday toolkit) ---------------- */
+function renderTasks() {
+  const list = $("#tasks-list");
+  list.innerHTML = "";
+  const open = state.tasks.filter((t) => !t.done);
+  const done = state.tasks.filter((t) => t.done);
+  const ordered = [...open, ...done];
+  if (!ordered.length) {
+    list.innerHTML = '<li class="doc-item muted-note">No tasks yet — type above or just ask me.</li>';
+    return;
+  }
+  for (const t of ordered) {
+    const li = document.createElement("li");
+    li.className = "doc-item task-item" + (t.done ? " done" : "");
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "task-check";
+    check.checked = t.done;
+    check.title = t.done ? "Mark as open" : "Mark as done";
+    check.onchange = async () => {
+      try {
+        const r = await api(`/api/tasks/${t.id}`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ done: !t.done }),
+        });
+        state.tasks = r.tasks;
+        renderTasks();
+      } catch (err) { toast(err.message, "err"); check.checked = t.done; }
+    };
+    const main = document.createElement("div");
+    main.className = "doc-main";
+    const nm = document.createElement("div");
+    nm.className = "doc-name mem-fact";
+    nm.textContent = t.text;
+    nm.title = t.text;
+    main.appendChild(nm);
+    if (t.due) {
+      const due = document.createElement("div");
+      due.className = "doc-meta task-due";
+      due.textContent = "due: " + t.due;
+      main.appendChild(due);
+    }
+    const del = document.createElement("button");
+    del.className = "doc-del";
+    del.textContent = "✕";
+    del.title = "Delete task";
+    del.onclick = async () => {
+      try {
+        const r = await api(`/api/tasks/${t.id}`, { method: "DELETE" });
+        state.tasks = r.tasks;
+        renderTasks();
+      } catch (err) { toast(err.message, "err"); }
+    };
+    li.append(check, main, del);
+    list.appendChild(li);
+  }
+}
+
+async function loadTasks() {
+  state.tasks = (await api("/api/tasks")).tasks;
+  renderTasks();
+}
+
+async function addTaskFromInput() {
+  const text = $("#task-input").value.trim();
+  if (!text) return;
+  try {
+    const r = await api("/api/tasks", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    $("#task-input").value = "";
+    state.tasks = r.tasks;
+    renderTasks();
+    toast("Task added.", "ok");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+function renderNotes() {
+  const list = $("#notes-list");
+  list.innerHTML = "";
+  if (!state.notes.length) {
+    list.innerHTML = '<li class="doc-item muted-note">No notes yet — type above or say "note that…".</li>';
+    return;
+  }
+  for (const n of state.notes.slice(0, 30)) {
+    const li = document.createElement("li");
+    li.className = "doc-item mem-item";
+    const main = document.createElement("div");
+    main.className = "doc-main";
+    const nm = document.createElement("div");
+    nm.className = "mem-fact";
+    nm.textContent = n.text;
+    nm.title = n.text;
+    const meta = document.createElement("div");
+    meta.className = "doc-meta";
+    meta.textContent = (n.created_at || "").slice(0, 10);
+    main.append(nm, meta);
+    const del = document.createElement("button");
+    del.className = "doc-del";
+    del.textContent = "✕";
+    del.title = "Delete note";
+    del.onclick = async () => {
+      try {
+        const r = await api(`/api/notes/${n.id}`, { method: "DELETE" });
+        state.notes = r.notes;
+        renderNotes();
+      } catch (err) { toast(err.message, "err"); }
+    };
+    li.append(main, del);
+    list.appendChild(li);
+  }
+}
+
+async function loadNotes() {
+  state.notes = (await api("/api/notes")).notes;
+  renderNotes();
+}
+
+async function addNoteFromInput() {
+  const text = $("#note-input").value.trim();
+  if (!text) return;
+  try {
+    const r = await api("/api/notes", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    $("#note-input").value = "";
+    state.notes = r.notes;
+    renderNotes();
+    toast("Note saved.", "ok");
+  } catch (err) { toast(err.message, "err"); }
+}
+
 /* ---------------- sessions sidebar ---------------- */
 function relTime(ts) {
   const diff = (Date.now() - new Date(ts.replace(" ", "T") + "Z")) / 1000;
@@ -412,6 +549,12 @@ const TOOL_LABELS = {
   run_python: "Running data analysis…",
   memory: "Updating memory…",
   time: "Checking the time…",
+  summarize_url: "Reading the page…",
+  generate_image: "Generating image…",
+  tasks: "Updating your tasks…",
+  notes: "Updating your notes…",
+  quiz_me: "Creating your quiz…",
+  convert: "Converting…",
 };
 
 function appendAssistant(text = "", sources = []) {
@@ -453,6 +596,50 @@ function addActivity(msg, html) {
   chip.innerHTML = html;
   act.appendChild(chip);
   scrollToBottom();
+}
+
+/* plan checklist: "Jarvis's plan" — steps tick off as the agent works */
+function addPlanBox(msg, plan, step = 0) {
+  let box = msg.querySelector(".plan-box");
+  if (!box) {
+    box = document.createElement("div");
+    box.className = "plan-box";
+    box.innerHTML = '<div class="plan-head">Jarvis\u2019s plan</div><ol></ol>';
+    const content = msg.querySelector(".content");
+    content.insertBefore(box, content.firstChild);
+  }
+  const ol = box.querySelector("ol");
+  ol.innerHTML = "";
+  (plan || []).forEach((p, i) => {
+    const li = document.createElement("li");
+    li.textContent = p;
+    if (i < step) li.className = "done";
+    else if (i === step) li.className = "active";
+    ol.appendChild(li);
+  });
+  scrollToBottom();
+}
+
+function addImage(msg, url) {
+  addActivity(msg, `<img class="gen-image" src="${url}" alt="generated image">`);
+}
+
+function addDownloadBtn(msg, text) {
+  const content = msg.querySelector(".content");
+  if (!content || content.querySelector(".dl-btn")) return;
+  const btn = document.createElement("button");
+  btn.className = "dl-btn";
+  btn.textContent = "⬇ Save as Markdown";
+  btn.title = "Download this answer as a .md file";
+  btn.onclick = () => {
+    const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "jarvis-answer.md";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  content.appendChild(btn);
 }
 
 function renderSources(msg, sources) {
@@ -561,6 +748,10 @@ async function sendMessage(text) {
             addActivity(assistantMsg, evt.label || "Working…");
           } else if (evt.type === "chart") {
             addActivity(assistantMsg, `<img class="chart" src="${evt.url}" alt="chart">`);
+          } else if (evt.type === "image") {
+            addImage(assistantMsg, evt.url);
+          } else if (evt.type === "plan") {
+            addPlanBox(assistantMsg, evt.plan || [], evt.step || 0);
           } else if (evt.type === "sources") {
             sources = evt.sources || [];
           } else if (evt.type === "memory") {
@@ -604,7 +795,10 @@ async function sendMessage(text) {
     // never wipe an error that is already displayed
     if (!gotError) {
       setAssistantText(assistantMsg, answer, [], false);
-      if (answer.trim()) renderSources(assistantMsg, sources);
+      if (answer.trim()) {
+        renderSources(assistantMsg, sources);
+        addDownloadBtn(assistantMsg, answer);
+      }
       if (answer.trim() && state.ttsEnabled) speak(answer);
     }
     if (state.current) loadSessions().catch(() => {});
@@ -769,6 +963,7 @@ function refreshSettings() {
     $("#tavily-input").placeholder = state.tavilySet ? "••••••  saved (type to replace)" : "tvly_…";
     $("#tavily-status").textContent = state.tavilySet ? "✓ Tavily key saved — web search will use it." : "";
     $("#tts-toggle").checked = state.ttsEnabled;
+    $("#img-toggle").checked = state.images;
     const vsel = $("#voice-select");
     vsel.innerHTML = "";
     for (const v of c.voices || ["troy", "austin", "hannah", "jessica", "sam", "leo", "mia"]) {
@@ -961,6 +1156,8 @@ function reloadWorkspace() {
       renderDocs(); renderSheets(); renderSessions(); updateStat();
     }),
     loadMemory(),
+    loadTasks(),
+    loadNotes(),
     refreshIdentity(),
   ]).catch(() => {});
 }
@@ -1024,6 +1221,7 @@ async function init() {
   state.tavilySet = !!st.tavily_set;
   state.model = st.model;
   state.voice = st.tts_voice || state.voice;
+  state.images = st.images_enabled !== false;
   setDemoChats(st.demo_max_chats);
   renderDocs();
   renderSheets();
@@ -1031,6 +1229,8 @@ async function init() {
   updateStat();
   renderQuota(st.usage || null);
   loadMemory().catch(() => {});
+  loadTasks().catch(() => {});
+  loadNotes().catch(() => {});
   $("#key-banner").classList.toggle("hidden", st.key_set);
   $("#tts-toggle").checked = state.ttsEnabled;
   if (st.clerk_pk) window.__CLERK_PK__ = st.clerk_pk;
@@ -1132,6 +1332,27 @@ $("#btn-refresh-memory").addEventListener("click", () => loadMemory().catch(() =
 $("#chat-search").addEventListener("input", renderSessions);
 $("#btn-mem-add").addEventListener("click", addMemoryFact);
 $("#mem-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addMemoryFact(); });
+
+// tasks + notes
+$("#btn-task-add").addEventListener("click", addTaskFromInput);
+$("#task-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addTaskFromInput(); });
+$("#btn-add-task").addEventListener("click", () => $("#task-input").focus());
+$("#btn-note-add").addEventListener("click", addNoteFromInput);
+$("#note-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addNoteFromInput(); });
+$("#btn-add-note").addEventListener("click", () => $("#note-input").focus());
+
+$("#img-toggle").addEventListener("change", async (e) => {
+  try {
+    const r = await api("/api/config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ images_enabled: e.target.checked }),
+    });
+    state.images = !!r.images_enabled;
+    const st = $("#img-status");
+    st.className = "key-status";
+    st.textContent = state.images ? "✓ Image tool enabled." : "Image tool disabled.";
+  } catch (err) { toast(err.message, "err"); }
+});
 
 // settings modal
 $("#btn-save-key").addEventListener("click", async () => {

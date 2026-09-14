@@ -2,6 +2,12 @@
 
 A single-agent personal assistant that answers from **your documents (RAG)**, analyzes **spreadsheets**, does **web search**, **math**, and **voice input/output** — all through one chat interface. Built as an evolution of the original DocChat app (same stack, same UI patterns).
 
+> **2026-09 update:** migrated to the live 2026 Groq lineup (default `qwen/qwen3.8-27b`,
+> fallback `openai/gpt-oss-120b` — the original default was decommissioned 2026-08-16),
+> added a visible multi-step planner and an everyday toolkit (tasks, notes, document
+> quizzes, unit/currency conversion, URL reading, free keyless image generation).
+> Test suite: 14 modules / 134 tests, all offline.
+
 - **100% local** except the Groq API (your key): embeddings and storage run on this machine.
 - One agent loop, no multi-agent machinery, no microservices.
 - Works with any Groq chat model; voice uses Groq Whisper (STT) + Groq Orpheus (TTS).

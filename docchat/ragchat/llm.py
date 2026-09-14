@@ -46,15 +46,42 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
+# Live model IDs (verified 2026-09 against https://console.groq.com/docs/models).
+# The legacy llama-3.3/3.1 IDs were decommissioned by Groq on 2026-08-16
+# (https://console.groq.com/docs/deprecations); DEAD_MODELS below keeps old
+# saved configs from selecting them again.
 DEFAULT_GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.6-27b",
+    "groq/compound-mini",  # agentic system: built-in web search + code execution
+]
+DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b")  # resilience net
+
+# Model IDs Groq has decommissioned (deprecations page, fetched 2026-09). Any
+# of these found in a saved config is auto-migrated to DEFAULT_MODEL so a stale
+# config.json or .env can never select a model that only returns 404s.
+DEAD_MODELS = {
     "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
     "llama3-8b-8192",
     "mixtral-8x7b-32768",
     "gemma2-9b-it",
-]
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "")  # optional resilience net
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "moonshotai/kimi-k2-instruct",
+    "moonshotai/kimi-k2-instruct-0905",
+    "qwen/qwen3-32b",
+    "playai-tts",
+    "playai-tts-arabic",
+}
+
+
+def migrate_model(model: str) -> str:
+    """Map a deprecated model ID to the current default. Live IDs pass through."""
+    return DEFAULT_MODEL if (model or "") in DEAD_MODELS else (model or "")
 
 # Voice (verified against https://console.groq.com/docs/text-to-speech)
 STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")

@@ -31,13 +31,14 @@ ANSWER_MAX_TOKENS = 1500
 CORRECTION_NOTE = ("\n\n> ⚠ _Parts of the above may not be fully supported by your "
                    "documents — I could not verify every claim against the sources._")
 
-SYSTEM_TPL = """You are Jarvis, a personal AI assistant. Help the user with questions, their uploaded documents, spreadsheets, calculations, and web lookups. Be concise and direct.
+SYSTEM_TPL = """You are Jarvis, a personal AI assistant in the style of Iron Man's Jarvis: proactive, precise, and organized. Help the user with questions, their uploaded documents, spreadsheets, calculations, web lookups, everyday tasks (to-dos, notes, studying), and image generation. Be concise and direct.
 
 {memory_block}
 
 AVAILABLE TOOLS — choose at most one per step; respond with ONLY a JSON object:
 {{
   "thought": "short reasoning",
+  "plan": ["step 1", "step 2"],
   "tool": "tool_name or null",
   "tool_input": {{ ...arguments... }}
 }}
@@ -49,6 +50,18 @@ AVAILABLE TOOLS — choose at most one per step; respond with ONLY a JSON object
 - run_python: {run_python}
 - memory: {memory}
 - time: {time}
+- summarize_url: {summarize_url}
+- generate_image: {generate_image}
+- tasks: {tasks}
+- notes: {notes}
+- quiz_me: {quiz_me}
+- convert: {convert}
+
+PLANNING:
+- For anything that needs more than one quick action (multi-part questions, coding tasks, planning requests like "plan my day" or "help me build X", comparisons), include "plan": an array of 2-5 short steps you intend to take, in order.
+- Work through the plan ONE step per decision: choose the tool for the current step only. Revise the plan (emit a new one) when results contradict it. Drop the plan when it is done.
+- Do NOT include a plan for simple one-tool or no-tool answers.
+- For coding tasks: draft the code, run it with run_python (omit sheet_id for a plain pandas/numpy sandbox), fix errors, then explain the solution.
 
 RULES:
 1. For questions about the user's uploaded files, call search_documents first.
@@ -56,10 +69,11 @@ RULES:
 3. Never claim facts from documents you have not searched.
 4. For spreadsheets: if you don't know the columns, call analyze_spreadsheet with op='info' first, then use the exact column names shown.
 5. Do NOT repeat the same call with the same arguments. It IS correct to call the same tool again with NEW arguments when you need more data (e.g. a spreadsheet op other than 'info', or a rewritten search query).
-6. Use web_search ONLY when the question genuinely needs live information: current news, prices, versions, live/real-time data, recent events, or unfamiliar topics where your knowledge may be outdated or incomplete. Do NOT search for simple, general, or well-known questions you can answer reliably from your own knowledge (basic math, common facts, definitions, coding basics) — and never search again when search_documents already gave you what you need.
+6. Use web_search ONLY when the question genuinely needs live information: current news, prices, versions, live/real-time data, recent events, or unfamiliar topics where your knowledge may be outdated or incomplete. Do NOT search for simple, general, or well-known questions you can answer reliably from your own knowledge (basic math, common facts, definitions, coding basics) — and never search again when search_documents already gave you what you need. To read one specific web page in depth, prefer summarize_url.
 7. If the user tells you a new fact about themselves ("I prefer...", "my name is...", "I work on...") or CHANGES something you know about them, call the memory tool (op='add' for new facts, op='update' for changes). Do not just acknowledge it — persist it.
-8. When you have enough information — or no tool applies — set "tool" to null. The final answer is generated afterwards, so do not include the answer text here.
-9. Output must be valid JSON only (json object)."""
+8. Everyday life: "add task / what's on my list / mark done" -> tasks; "note that... / find my note" -> notes; "convert 5 km to miles / 100 USD to EUR" -> convert; "make me an image of..." -> generate_image; "quiz me" -> quiz_me.
+9. When you have enough information — or no tool applies — set "tool" to null. The final answer is generated afterwards, so do not include the answer text here.
+10. Output must be valid JSON only (json object)."""
 
 FINAL_RAG_TPL = """You are Jarvis, a personal AI assistant.
 
@@ -118,6 +132,7 @@ class Agent:
         get_sheet_path=None,
         is_disconnected=None,
         uid: str = "",
+        images_enabled: bool = True,
     ):
         self.key = key
         self.model = model
@@ -127,10 +142,15 @@ class Agent:
         self.embed_fn = embed_fn
         self.get_sheet_path = get_sheet_path or (lambda _sid: None)
         self.is_disconnected = is_disconnected or (lambda: False)
-        self.uid = uid  # identity for chart URLs (fetched via <img>, no headers)
+        self.uid = uid  # identity for chart/image URLs (fetched via <img>, no headers)
         self._last_sources: list[dict] = []
         self._chart_event: dict | None = None
         self._web_cache: dict[str, str] = {}  # per-turn dedup of web queries
+        self._url_cache: dict[str, str] = {}  # per-turn dedup of URL fetches
+        self._images_enabled = bool(images_enabled)
+
+    def image_disabled(self) -> bool:
+        return not self._images_enabled
 
     # ---------------- injected defaults (real Groq via ragchat.llm) ----------------
     async def _chat_impl(self, key, model, messages, json_mode=False, temperature=0.2, max_tokens=1200):
@@ -158,11 +178,14 @@ class Agent:
         yield {"type": "status", "label": "Understanding request"}
         mem_block = memory.format_memory_block(
             memory.build_memory_context(self.store, session_id, question)) if session_id else ""
-        tool_log: list[str] = []
+        tool_log: list[dict] = []
         sources: list[dict] = []
         steps = 0
         last_call: str | None = None
+        plan: list[str] = []
+        current_step = 0
         self._web_cache = {}  # fresh dedup cache per turn
+        self._url_cache = {}
 
         while steps < MAX_STEPS:
             steps += 1
@@ -171,11 +194,23 @@ class Agent:
             decision = await self._decide(question, history, mem_block, tool_log)
             if decision is None:
                 break  # model output unparseable -> answer with what we have
+            new_plan = decision.get("plan")
+            if isinstance(new_plan, list) and new_plan:
+                cleaned = [str(s).strip() for s in new_plan if str(s).strip()][:MAX_STEPS]
+                if cleaned and cleaned != plan:
+                    current_step = 0  # new/revised plan: restart step tracking
+                    plan = cleaned
+                    yield {"type": "plan", "plan": plan, "step": current_step}
             tool = decision.get("tool")
             if not tool or tool in ("answer", "respond", "null"):
+                if plan and current_step < len(plan):
+                    current_step = len(plan)  # plan fulfilled -> stop tracking
                 break
             if tool not in TOOL_DOCS:
-                tool_log.append(f"Tool '{tool}' unknown; ignored. Pick from: {', '.join(TOOL_DOCS)}.")
+                tool_log.append({"label": f"{tool} (unknown tool)",
+                                 "result": f"Tool '{tool}' unknown; ignored. "
+                                           f"Pick from: {', '.join(TOOL_DOCS)}.",
+                                 "step": current_step})
                 continue
             args = decision.get("tool_input") or {}
             call_sig = f"{tool}({json.dumps(args, default=str, sort_keys=True)})"
@@ -188,7 +223,11 @@ class Agent:
             result, evt = await self._run_tool(tool, args)
             if evt:
                 yield evt
-            tool_log.append(f"Tool call {steps}: {tool}({json.dumps(args, default=str)[:300]})\nResult:\n{result[:2500]}")
+            tool_log.append({"label": f"{tool}({json.dumps(args, default=str)[:300]})",
+                             "result": result[:2500], "step": current_step if plan else None})
+            if plan:
+                current_step += 1
+                yield {"type": "plan", "plan": plan, "step": current_step}
             if tool == "search_documents":
                 sources = self._last_sources
 
@@ -454,6 +493,178 @@ class Agent:
         now = datetime.datetime.now(datetime.timezone.utc)
         return (f"Current UTC time: {now.strftime('%Y-%m-%d %H:%M:%S')} ({now.strftime('%A')}).")
 
+    @registry.register(
+        "summarize_url",
+        'Fetch a web page and extract its readable text (or a summary). Args: '
+        '{"url": "https://...", "mode": "text|summary"}. Use for a page the user '
+        'names or pastes; use web_search to discover pages.',
+        category="web",
+    )
+    async def _tool_summarize_url(self, args: dict):
+        url = str(args.get("url") or "").strip()
+        if not url:
+            return "Error: empty url."
+        try:
+            text = await asyncio.to_thread(tools.fetch_url_text, url)
+        except ValueError as e:
+            return (f"Error: {e}. Try web_search instead, or ask the user to paste "
+                    "the relevant text.")
+        if not text:
+            return "Error: the page contained no readable text (it may be JavaScript-rendered)."
+        if str(args.get("mode") or "text").lower() == "summary":
+            messages = [{"role": "user", "content":
+                f"Summarize the following web page in 5-8 bullet points, keeping key "
+                f"numbers and names. Page URL: {url}\n\n{text[:9000]}"}]
+            try:
+                return "Summary of " + url + ":\n" + await self.llm_chat(
+                    self.key, self.model, messages, temperature=0.2, max_tokens=700)
+            except Exception as e:
+                log.warning("url summary failed, returning raw text: %s", e)
+                return f"Text of {url}:\n{text}"
+        return f"Text of {url}:\n{text}"
+
+    @registry.register(
+        "generate_image",
+        'Generate an image from a text description (free, no key). Args: '
+        '{"prompt": "detailed description", "width": int, "height": int}. '
+        'Use whenever the user asks to draw/create/generate a picture.',
+        category="creative",
+    )
+    async def _tool_generate_image(self, args: dict):
+        if self.image_disabled():
+            return "Image generation is disabled in Settings."
+        prompt = str(args.get("prompt") or "").strip()
+        if not prompt:
+            return "Error: empty prompt."
+        try:
+            w = max(256, min(int(args.get("width") or 768), 1280))
+            h = max(256, min(int(args.get("height") or 512), 1280))
+        except (TypeError, ValueError):
+            w, h = 768, 512
+        url = tools.image_url(prompt, w, h)
+        self._chart_event = {"type": "image", "url": url}
+        return f"Image generated: {url}\nDescribe it briefly in your answer; the UI displays the image automatically."
+
+    @registry.register(
+        "tasks",
+        'Everyday to-do list. Args: {"op": "add|list|done|delete", "text": str '
+        '(add), "due": str optional (e.g. "friday", "2026-09-20"), "id": int '
+        '(done/delete). Use for "add task", "my to-dos", "mark done".',
+        category="life",
+    )
+    async def _tool_tasks(self, args: dict):
+        op = str(args.get("op") or "list").strip().lower()
+        if op == "add":
+            text = str(args.get("text") or "").strip()
+            if not text:
+                return "Error: 'text' is required for op='add'."
+            due = str(args.get("due") or "").strip() or None
+            row = self.store.add_task(text, due)
+            return f"Task added#{row['id']}: {row['text']}" + (f" (due: {due})" if due else "")
+        if op == "done":
+            try:
+                tid = int(args.get("id") or 0)
+            except (TypeError, ValueError):
+                return "Error: 'id' must be a number for op='done'."
+            open_tasks = [t for t in self.store.list_tasks(include_done=False) if t["id"] == tid]
+            if not open_tasks:
+                return f"Error: no open task with id {tid}."
+            self.store.set_task_done(tid, True)
+            return f"Task #{tid} completed: {open_tasks[0]['text']}"
+        if op == "delete":
+            try:
+                tid = int(args.get("id") or 0)
+            except (TypeError, ValueError):
+                return "Error: 'id' must be a number for op='delete'."
+            return (f"Deleted task #{tid}." if self.store.delete_task(tid)
+                    else f"Error: no task with id {tid}.")
+        # list (default)
+        tasks = self.store.list_tasks()
+        if not tasks:
+            return "No tasks yet. Add one with op='add'."
+        lines = [f"[{t['id']}] {'x' if t['done'] else ' '} {t['text']}"
+                 + (f" (due: {t['due']})" if t['due'] else "") for t in tasks]
+        open_count = sum(1 for t in tasks if not t["done"])
+        return f"{open_count} open / {len(tasks)} total:\n" + "\n".join(lines)
+
+    @registry.register(
+        "notes",
+        'Quick personal notes. Args: {"op": "add|list|delete", "text": str (add), '
+        '"query": str (list filter), "id": int (delete). Use for "note that...", '
+        '"find my note about...".',
+        category="life",
+    )
+    async def _tool_notes(self, args: dict):
+        op = str(args.get("op") or "list").strip().lower()
+        if op == "add":
+            text = str(args.get("text") or "").strip()
+            if not text:
+                return "Error: 'text' is required for op='add'."
+            row = self.store.add_note(text)
+            return f"Note saved#{row['id']}."
+        if op == "delete":
+            try:
+                nid = int(args.get("id") or 0)
+            except (TypeError, ValueError):
+                return "Error: 'id' must be a number for op='delete'."
+            return (f"Deleted note #{nid}." if self.store.delete_note(nid)
+                    else f"Error: no note with id {nid}.")
+        # list (default), optional filter
+        notes = self.store.list_notes(str(args.get("query") or ""))
+        if not notes:
+            return "No notes match."
+        return "\n".join(f"[{n['id']}] {n['text'][:200]}" for n in notes[:20])
+
+    @registry.register(
+        "quiz_me",
+        'Create a study quiz from the user\'s uploaded documents. Args: '
+        '{"topic": str (optional), "num_questions": int (default 3)}. Retrieve '
+        'passages and write questions; grade the user\'s answers in later turns.',
+        category="life",
+    )
+    async def _tool_quiz_me(self, args: dict):
+        if self.store.total_chunks() == 0:
+            return "Error: no documents uploaded yet — add files to study from."
+        topic = str(args.get("topic") or "").strip()
+        try:
+            k = min(max(int(args.get("num_questions") or 3), 1), 5)
+        except (TypeError, ValueError):
+            k = 3
+        query = topic or "key concepts definitions important facts"
+        hits, _meta = await asyncio.to_thread(retrieval.retrieve, self.store, query, 4,
+                                              embed_fn=self.embed_fn, keyword_only=False)
+        if not hits:
+            return "I couldn't find relevant material in your documents for that topic."
+        passages = "\n\n".join(f"[{i}] {h['text'][:800]}" for i, h in enumerate(hits, 1))
+        messages = [{"role": "user", "content":
+            f"Create a {k}-question study quiz from these passages"
+            + (f" about: {topic}" if topic else "") + ".\n"
+            "Number the questions. After ALL questions, add a line '---' and a compact "
+            "answer key. Keep questions answerable from the passages.\n\nPASSAGES:\n"
+            + passages}]
+        try:
+            return await self.llm_chat(self.key, self.model, messages,
+                                       temperature=0.4, max_tokens=900)
+        except Exception as e:
+            log.warning("quiz generation failed: %s", e)
+            return "Error: quiz generation failed — try again in a moment."
+
+    @registry.register(
+        "convert",
+        'Convert units, temperatures, or currencies. Args: {"from_unit": str, '
+        '"to_unit": str, "value": number}. Examples: km->mi, c->f, kg->lb, '
+        'gb->mb, usd->eur. Currency uses a free live-rate service.',
+        category="life",
+    )
+    async def _tool_convert(self, args: dict):
+        try:
+            value = float(args.get("value") or 0)
+        except (TypeError, ValueError):
+            return "Error: 'value' must be a number."
+        return await asyncio.to_thread(
+            tools.convert, str(args.get("from_unit") or ""),
+            str(args.get("to_unit") or ""), value)
+
     async def _spreadsheet(self, args: dict) -> str:
         from . import spreadsheet
 
@@ -523,6 +734,15 @@ class Agent:
         return await asyncio.to_thread(t.run_python, code, df_json)
 
     # ---------------- final answers ----------------
+    @staticmethod
+    def _format_tool_log(entries: list[dict], limit: int = 6) -> str:
+        """Render tool_log dicts (label/result/step) as prompt text."""
+        lines = []
+        for e in entries[-limit:]:
+            step = f" (plan step {e['step'] + 1})" if e.get("step") is not None else ""
+            lines.append(f"Tool call:{step} {e['label']}\nResult:\n{e['result']}")
+        return "\n\n".join(lines)
+
     def _source_blocks(self, sources: list[dict]) -> str:
         blocks = []
         for i, s in enumerate(sources, 1):
@@ -536,7 +756,7 @@ class Agent:
         yield {"type": "status", "label": "Verifying sources…"}
         messages = self._messages(
             FINAL_RAG_TPL.format(memory_block=mem_block,
-                                 tool_log="\n".join(tool_log[-6:])), history, question, [])
+                                 tool_log=self._format_tool_log(tool_log)), history, question, [])
         # pin the sources explicitly so generation is grounded regardless of tool log
         messages[-1] = {"role": "user", "content":
             f"QUESTION: {question}\n\nSOURCES:\n{self._source_blocks(sources)}"}
@@ -555,7 +775,7 @@ class Agent:
     async def _answer_with_tools(self, question, history, mem_block, tool_log):
         yield {"type": "status", "label": "Composing answer…"}
         messages = self._messages(
-            FINAL_RAG_TPL.format(memory_block=mem_block, tool_log="\n".join(tool_log[-6:])),
+            FINAL_RAG_TPL.format(memory_block=mem_block, tool_log=self._format_tool_log(tool_log)),
             history, question, [])
         try:
             answer = await self.llm_chat(self.key, self.model, messages, temperature=0.2,
@@ -649,7 +869,7 @@ class Agent:
         if tool_log:
             # the model must SEE the tool results to decide the next step
             messages.append({"role": "assistant", "content": "I called tools to gather information."})
-            messages.append({"role": "user", "content": "TOOL RESULTS:\n" + "\n\n".join(tool_log[-4:])})
+            messages.append({"role": "user", "content": "TOOL RESULTS:\n" + self._format_tool_log(tool_log, 4)})
         return messages
 
     @staticmethod
