@@ -203,6 +203,35 @@ def test_ocr_engine_smoke_when_installed():
     assert ocr.ocr_image_bytes(b"definitely not an image") == ""  # never raises
 
 
+def test_ocr_result_shapes_across_rapidocr_versions():
+    """RapidOCR 1.x returns (rows, elapse) with rows shaped [box, text, score];
+    3.x returns one result object exposing .txts. Both must produce text —
+    unpacking the 3.x object raised TypeError and OCR'd every scan to ""."""
+
+    class _Result3x:  # rapidocr 3.x RapidOCROutput
+        txts = ("Scanned invoice", "Total 4500 USD")
+
+    class _Empty3x:
+        txts = ()
+
+    class _Engine:
+        def __init__(self, out):
+            self.out = out
+
+        def __call__(self, _img):
+            return self.out
+
+    rows = [[[[0, 0], [1, 0], [1, 1], [0, 1]], "Hello scan", 0.99], [None, "second line", 0.5]]
+    assert ocr._lines_from_result(ocr._call_engine(_Engine((rows, [0.1])), None)) == \
+        ["Hello scan", "second line"]
+    assert ocr._lines_from_result(ocr._call_engine(_Engine(_Result3x()), None)) == \
+        ["Scanned invoice", "Total 4500 USD"]
+    # nothing recognized / odd rows: never raises, just no text
+    assert ocr._lines_from_result(ocr._call_engine(_Engine((None, [0.0])), None)) == []
+    assert ocr._lines_from_result(ocr._call_engine(_Engine(_Empty3x()), None)) == []
+    assert ocr._lines_from_result(None) == []
+
+
 def test_doc_stats_new_kinds():
     assert parsing.doc_stats("d.pptx")["kind"] == "powerpoint"
     assert parsing.doc_stats("d.json")["kind"] == "json"

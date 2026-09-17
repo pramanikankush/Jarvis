@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 
 import envfile
 
@@ -75,7 +76,30 @@ def save_config() -> None:
 
 load_config()
 
-app = FastAPI(title="Jarvis")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Load the local embedding model in the background at startup.
+
+    The one-time ~100 MB download used to happen inside a user's first upload,
+    where it stalled for 40 s+ and surfaced as an HTTP 503 on attachments
+    (pdf/docx included — the trigger is the model, not the file type). Doing it
+    here makes the first upload fast and lets /api/state report the real state.
+    Set DOCCHAT_WARM_EMBEDDINGS=0 to skip (e.g. an image that pre-caches it).
+    """
+    warm = None
+    if os.environ.get("DOCCHAT_WARM_EMBEDDINGS", "1") not in ("0", "false", "no"):
+        log.info("warming the local embedding model in the background (cache: %s)",
+                 llm.embed_cache_dir())
+        warm = asyncio.create_task(asyncio.to_thread(llm.warm_embeddings))
+    try:
+        yield
+    finally:
+        if warm and not warm.done():
+            warm.cancel()
+
+
+app = FastAPI(title="Jarvis", lifespan=lifespan)
 
 
 def sse(data: dict) -> str:
@@ -101,6 +125,21 @@ def get_key() -> str:
     if not key:
         raise HTTPException(400, "No Groq API key configured — open Settings and paste your key.")
     return key
+
+
+def embed_503(e: Exception) -> HTTPException:
+    """503 for an upload whose local embedding model could not start.
+
+    Embedding is a local dependency of every upload (there is no cloud
+    fallback), so this is the one failure the user must be able to act on: the
+    message names the underlying error, the model, and where it is cached.
+    """
+    return HTTPException(
+        503,
+        f"Embedding model unavailable — {str(e).strip().rstrip('.')}. Uploads are "
+        f"indexed locally with {llm.EMBED_MODEL}, which is downloaded once "
+        f"(~100 MB, needs internet) and then cached in {llm.embed_cache_dir()}.",
+    )
 
 
 def chat_limit_reached(db, uid: str, limit: int = DEMO_MAX_CHATS) -> bool:
@@ -232,9 +271,7 @@ async def upload_doc(request: Request):
     try:
         doc, _chunks = await ingest.ingest_doc(db, name, data)
     except ingest.EmbedError as e:
-        raise HTTPException(
-            503, f"Embedding model failed to start: {e} (first run downloads ~100 MB; needs internet)"
-        )
+        raise embed_503(e)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return JSONResponse({"ok": True, "doc": doc, "docs": db.list_docs()})
@@ -269,9 +306,7 @@ async def attach_doc(request: Request):
     try:
         doc, chunk_count = await ingest.ingest_doc(db, name, data)
     except ingest.EmbedError as e:
-        raise HTTPException(
-            503, f"Embedding model failed to start: {e} (first run downloads ~100 MB; needs internet)"
-        )
+        raise embed_503(e)
     except ValueError as e:
         raise HTTPException(400, str(e))
     stats = parsing.doc_stats(doc["name"])

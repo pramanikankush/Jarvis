@@ -75,6 +75,8 @@ be exported in your shell.
 | `GROQ_TTS_MODEL` | `canopylabs/orpheus-v1-english` | Text-to-speech model |
 | `GROQ_TTS_VOICE` | `troy` | Default TTS voice |
 | `DOCCHAT_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Local embedding model |
+| `FASTEMBED_CACHE` | `data/models` | Where the embedding model is cached (persistent volume!) |
+| `DOCCHAT_WARM_EMBEDDINGS` | `1` | Load the embedding model at startup (set `0` to skip) |
 | `PORT` | 8000 | Server port |
 
 ## Architecture
@@ -176,6 +178,14 @@ without the OCR stack installed, image OCR, corrupt-file errors).
 
 ## Notes & limits
 
+- **Attachments failing with HTTP 503** mean the local embedding model could not
+  start, not that the file type is unsupported (parsing problems return 400).
+  Every upload embeds its chunks with `bge-small`, which is downloaded once
+  (~100 MB, needs internet) into `FASTEMBED_CACHE` (`data/models` by default).
+  The `detail` in the 503 body carries the underlying error, and `/api/state`
+  reports `embedding.state` (`cold`/`loading`/`ready`/`error: …`) — the UI warns
+  at startup when it is an error. The model is loaded in the background at
+  startup, so afterwards uploads work offline.
 - Scanned/image-only PDFs and image files are read via local OCR (RapidOCR, capped at 30
   pages); very poor scans (blank, skewed, low-quality) may still fail with a clear message.
 - Files > 50 MB rejected; very large files truncated at ~300k chars.

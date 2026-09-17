@@ -169,6 +169,97 @@ def test_agent_without_attachments_leaves_prompt_unchanged():
         st.close()
 
 
+def test_embed_cache_is_durable_not_the_os_temp_dir():
+    """503s on attachments came from the embedding model being re-downloaded
+    inside the upload request whenever fastembed's OS-temp cache was wiped.
+    Resolution order: FASTEMBED_CACHE > data/models > legacy temp cache."""
+    from ragchat import llm
+
+    saved_env = os.environ.pop("FASTEMBED_CACHE", None)
+    saved_durable, saved_legacy = llm.DEFAULT_EMBED_CACHE, llm.legacy_embed_cache_dir
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            durable = os.path.join(td, "data", "models")
+            legacy = os.path.join(td, "fastembed_cache")
+            os.makedirs(legacy)
+            llm.DEFAULT_EMBED_CACHE = durable
+            llm.legacy_embed_cache_dir = lambda: legacy
+            # nothing cached yet -> download into the durable (volume) dir
+            assert llm.embed_cache_dir() == durable
+            # a model already in fastembed's old temp cache is reused
+            open(os.path.join(legacy, "model.onnx"), "wb").close()
+            assert llm.embed_cache_dir() == legacy
+            # ...unless the durable cache has one too, which wins
+            os.makedirs(durable)
+            open(os.path.join(durable, "model.onnx"), "wb").close()
+            assert llm.embed_cache_dir() == durable
+            # an explicit FASTEMBED_CACHE (Docker: /opt/fastembed) always wins
+            os.environ["FASTEMBED_CACHE"] = os.path.join(td, "pinned")
+            assert llm.embed_cache_dir() == os.environ["FASTEMBED_CACHE"]
+    finally:
+        llm.DEFAULT_EMBED_CACHE, llm.legacy_embed_cache_dir = saved_durable, saved_legacy
+        os.environ.pop("FASTEMBED_CACHE", None)
+        if saved_env is not None:
+            os.environ["FASTEMBED_CACHE"] = saved_env
+
+
+def test_embed_failure_fails_fast_then_retries_after_the_cooldown():
+    """A failed embedding load is reported (state + 503 body) and uploads
+    fail fast instead of stalling ~40 s on every attempt, yet the load is
+    genuinely retried after the cooldown so recovery is automatic."""
+    import time
+
+    from ragchat import llm
+
+    saved = (llm._embedder, llm._embed_state, llm._embed_failed_at, llm._embed_fatal,
+             llm._load_embedder)
+    try:
+        llm._embedder = None
+        llm._embed_fatal = False
+        llm._embed_state = "error: Could not load model X from any source."
+        llm._embed_failed_at = time.monotonic()
+        assert llm.embed_error() == "Could not load model X from any source."
+        assert llm.embed_state()["state"].startswith("error")
+        start = time.monotonic()
+        try:
+            llm._get_embedder()
+            assert False, "should have raised"
+        except RuntimeError as e:
+            assert "Could not load model X from any source." in str(e), e
+            assert "retrying" in str(e), e
+        assert time.monotonic() - start < 1, "must not re-attempt the download inside the cooldown"
+
+        # once the cooldown expires the load is attempted again (offline double)
+        attempts = []
+
+        def _boom():
+            attempts.append(1)
+            raise RuntimeError("still offline")
+
+        llm._load_embedder = _boom
+        llm._embed_failed_at = time.monotonic() - llm.EMBED_RETRY_AFTER - 1
+        try:
+            llm._get_embedder()
+            assert False, "should have raised"
+        except RuntimeError as e:
+            assert "still offline" in str(e), e
+        assert attempts == [1], attempts
+        assert llm.embed_error() == "still offline"
+    finally:
+        (llm._embedder, llm._embed_state, llm._embed_failed_at, llm._embed_fatal,
+         llm._load_embedder) = saved
+
+
+def test_embed_state_reports_the_cache_and_reason():
+    """A bare 503 is useless: /api/state must carry the model's state so the UI
+    can say why uploads fail."""
+    from ragchat import llm
+
+    st = llm.embed_state()
+    assert st["model"] and st["cache_dir"], st
+    assert st["state"] == "ready" or st["state"] == "cold" or st["state"].startswith("error"), st
+
+
 def test_doc_stats_descriptor():
     from ragchat import parsing
 

@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import time
 
 import httpx
 import numpy as np
@@ -89,33 +91,122 @@ TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
 TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "troy")
 TTS_VOICES = ["troy", "austin", "hannah", "jessica", "sam", "leo", "mia"]
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Durable home for the embedding model next to the SQLite data (data/ is the
+# mounted volume in Docker), NOT fastembed's default OS-temp cache: Windows
+# Disk Cleanup / Storage Sense wipe Temp, and the next upload then had to
+# re-download ~100 MB *inside the request* — which is what turned the first
+# attachment into an HTTP 503 when that download was slow or blocked.
+DEFAULT_EMBED_CACHE = os.path.join(_PROJECT_ROOT, "data", "models")
+
 _embedder = None
-_embed_state = "cold"  # cold | loading | ready | error
+_embed_state = "cold"  # cold | loading | ready | error: <reason>
+_embed_fatal = False  # True only when retrying cannot help (fastembed missing)
+_embed_failed_at = 0.0  # monotonic time of the last failed load
+# A failed load spends ~40 s retrying the download; answering every following
+# upload with that same stall would hit proxy timeouts and hide the reason.
+# For this many seconds uploads fail fast with the cached reason instead, then
+# the load is genuinely retried so an offline machine recovers by itself.
+EMBED_RETRY_AFTER = float(os.environ.get("DOCCHAT_EMBED_RETRY_AFTER", "60") or "60")
+
+
+def _has_cache(path: str) -> bool:
+    """True when a directory holds at least one entry (a downloaded model)."""
+    try:
+        with os.scandir(path) as it:
+            return any(True for _ in it)
+    except OSError:
+        return False
+
+
+def legacy_embed_cache_dir() -> str:
+    """fastembed's own default cache (inside the OS temp dir). Only consulted
+    so an install that already downloaded the model there is not forced to
+    re-download it now that the default cache moved to data/models."""
+    return os.path.join(tempfile.gettempdir(), "fastembed_cache")
+
+
+def embed_cache_dir() -> str:
+    """Where the embedding model is stored: FASTEMBED_CACHE when set (the
+    Docker image pre-downloads into /opt/fastembed), else the durable
+    data/models; a model already sitting (only) in fastembed's legacy temp
+    cache is reused rather than re-downloaded."""
+    env = os.environ.get("FASTEMBED_CACHE")
+    if env:
+        return env
+    if _has_cache(DEFAULT_EMBED_CACHE):
+        return DEFAULT_EMBED_CACHE
+    legacy = legacy_embed_cache_dir()
+    if _has_cache(legacy):
+        log.info("using the existing embedding cache at %s", legacy)
+        return legacy
+    return DEFAULT_EMBED_CACHE
 
 
 def embed_state() -> dict:
-    global _embed_state
+    """The embedding model's state for the UI / the health check:
+    cold | loading | ready | error: <why>, plus the model and cache location."""
+    global _embed_state, _embed_fatal
     if _embed_state == "cold":
         try:
             import fastembed  # noqa: F401 (verifies install)
         except ImportError:
             _embed_state = "error: 'fastembed' not installed — run: pip install -r requirements.txt"
-    return {"state": _embed_state, "model": EMBED_MODEL}
+            _embed_fatal = True
+    return {"state": _embed_state, "model": EMBED_MODEL, "cache_dir": embed_cache_dir()}
+
+
+def embed_error() -> str:
+    """The reason the embedding model is not ready ("" when there is none),
+    with the display "error: " prefix stripped."""
+    return _embed_state.removeprefix("error: ") if _embed_state.startswith("error") else ""
+
+
+def _load_embedder():
+    """Build the local ONNX embedding model (a seam so the retry behaviour is
+    testable without a 100 MB download)."""
+    from fastembed import TextEmbedding
+
+    return TextEmbedding(model_name=EMBED_MODEL, cache_dir=embed_cache_dir())
 
 
 def _get_embedder():
-    global _embedder, _embed_state
-    if _embedder is None:
-        if _embed_state.startswith("error"):
-            raise RuntimeError(
-                "'fastembed' is not installed. Run: pip install -r requirements.txt"
-            )
-        _embed_state = "loading"
-        from fastembed import TextEmbedding
-
-        _embedder = TextEmbedding(model_name=EMBED_MODEL, cache_dir=os.environ.get("FASTEMBED_CACHE"))
-        _embed_state = "ready"
+    global _embedder, _embed_state, _embed_fatal, _embed_failed_at
+    if _embedder is not None:
+        return _embedder
+    if _embed_fatal:
+        raise RuntimeError(
+            "'fastembed' is not installed. Run: pip install -r requirements.txt"
+        )
+    if _embed_failed_at and time.monotonic() - _embed_failed_at < EMBED_RETRY_AFTER:
+        left = int(EMBED_RETRY_AFTER - (time.monotonic() - _embed_failed_at)) + 1
+        raise RuntimeError(f"{embed_error()} (retrying in ~{left}s)")
+    _embed_state = "loading"
+    try:
+        _embedder = _load_embedder()
+    except Exception as e:
+        # Record the real reason (the UI shows it instead of a bare 503) but
+        # stay retryable: a download that failed while offline must be able to
+        # succeed once the machine is online again.
+        _embed_state = f"error: {e}"
+        _embed_failed_at = time.monotonic()
+        raise
+    _embed_state = "ready"
+    _embed_failed_at = 0.0
     return _embedder
+
+
+def warm_embeddings() -> bool:
+    """Load the embedding model ahead of the first upload. Never raises — the
+    server calls this at startup so the one-time ~100 MB download happens then,
+    not in the middle of a user's request."""
+    try:
+        _get_embedder()
+        log.info("embedding model %s ready (cache: %s)", EMBED_MODEL, embed_cache_dir())
+        return True
+    except Exception as e:
+        log.warning("embedding model is not ready (%s) — uploads will fail until it loads", e)
+        return False
 
 
 def embed_texts(texts: list[str]) -> np.ndarray:

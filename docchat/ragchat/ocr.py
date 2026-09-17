@@ -56,29 +56,56 @@ def _get_engine():
     return _engine
 
 
+def _call_engine(engine, img: np.ndarray):
+    """Run the engine and normalize its return shape to a single result.
+
+    RapidOCR 1.x returns ``(rows, elapse)`` where rows are [box, text, score];
+    RapidOCR 3.x returns one result object (``RapidOCROutput``). Unpacking the
+    3.x object raised TypeError, which the caller swallowed — every image and
+    scanned page then OCR'd to "" and looked like an unreadable file.
+    """
+    out = engine(img)
+    if isinstance(out, tuple) and len(out) == 2:
+        return out[0]  # 1.x: (rows, elapse)
+    return out  # 3.x: the result object itself
+
+
+def _lines_from_result(result) -> list[str]:
+    """Recognized text lines from a RapidOCR result, shape-agnostically:
+    a 3.x object exposing ``txts``, or 1.x rows shaped [box, text, score].
+    Anything unexpected is logged and skipped — never raised."""
+    if result is None:
+        return []
+    items = getattr(result, "txts", None)
+    if items is None:
+        items = result
+    lines: list[str] = []
+    try:
+        for item in items:
+            if isinstance(item, str):
+                text = item
+            elif isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], str):
+                text = item[1]
+            else:
+                continue
+            text = text.strip()
+            if text:
+                lines.append(text)
+    except TypeError as e:
+        log.warning("unexpected OCR result shape: %s", e)
+    return lines
+
+
 def ocr_image(img: np.ndarray) -> str:
     """Run OCR on an RGB uint8 image array; return the recognized lines
     joined with newlines ("" when nothing is recognized)."""
     engine = _get_engine()
     try:
-        result, _elapse = engine(img)
+        result = _call_engine(engine, img)
     except Exception as e:  # engine-level failure (corrupt frame, model error)
         log.warning("ocr_image failed: %s", e)
         return ""
-    if result is None:
-        return ""
-    lines: list[str] = []
-    try:
-        for item in result:
-            # RapidOCR rows are [box(4x2), text, score] (1.3.x) or an
-            # OCRResult-like sequence with the same shape (1.4.x)
-            if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], str):
-                text = item[1].strip()
-                if text:
-                    lines.append(text)
-    except TypeError as e:
-        log.warning("unexpected OCR result shape: %s", e)
-    return "\n".join(lines)
+    return "\n".join(_lines_from_result(result))
 
 
 def ocr_image_bytes(data: bytes) -> str:

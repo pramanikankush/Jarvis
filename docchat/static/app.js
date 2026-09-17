@@ -1310,6 +1310,12 @@ async function init() {
   renderSessions();
   updateStat();
   renderQuota(st.usage || null);
+  // A dead local embedding model breaks every upload with HTTP 503, so surface
+  // it at startup instead of only after a failed attachment.
+  const embedState = String((st.embedding && st.embedding.state) || "");
+  if (embedState.startsWith("error")) {
+    toast(`Document indexing is unavailable: ${embedState.replace(/^error:\s*/, "")}`, "err");
+  }
   loadMemory().catch(() => {});
   loadTasks().catch(() => {});
   loadNotes().catch(() => {});
