@@ -374,6 +374,12 @@ async def upload_doc(request: Request):
         raise embed_503(e)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except Exception as e:
+        # Any other failure (corrupt file tripping a parser, DB error, …)
+        # must be a JSON error, never a raw 500: bare 500s surface as
+        # opaque HTTP 502s behind hosting proxies.
+        log.exception("document upload failed: %s", name)
+        raise HTTPException(500, f"Could not process '{name}': {e}")
     return JSONResponse({"ok": True, "doc": doc, "docs": db.list_docs()})
 
 
@@ -409,6 +415,10 @@ async def attach_doc(request: Request):
         raise embed_503(e)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except Exception as e:
+        # See /api/docs: never a raw 500 (proxies turn those into HTTP 502s).
+        log.exception("attachment upload failed: %s", name)
+        raise HTTPException(500, f"Could not process '{name}': {e}")
     stats = parsing.doc_stats(doc["name"])
     return JSONResponse({"ok": True, "doc": doc, "chunks": chunk_count,
                          "stats": stats, "docs": db.list_docs()})

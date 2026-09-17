@@ -26,4 +26,7 @@ RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 
 EXPOSE 8000
-CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+# Render (and most hosts) assign the listen port via $PORT. A hardcoded port
+# means the proxy routes to a port nothing listens on -> HTTP 502 on every API
+# call (uploads, chat, state). `exec` keeps uvicorn as PID 1 for clean SIGTERM.
+CMD ["sh", "-c", "exec python -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]

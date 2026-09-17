@@ -74,12 +74,20 @@ def _single(text: str) -> list[tuple[int | None, str]]:
 
 
 def _parse_pdf(data: bytes) -> list[tuple[int, str]]:
-    reader = PdfReader(io.BytesIO(data))
-    pages = []
-    for i, page in enumerate(reader.pages, 1):
-        text = (page.extract_text() or "").strip()
-        if len(text) >= MIN_PDF_PAGE_CHARS:
-            pages.append((i, text[:MAX_FILE_CHARS]))
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = []
+        for i, page in enumerate(reader.pages, 1):
+            text = (page.extract_text() or "").strip()
+            if len(text) >= MIN_PDF_PAGE_CHARS:
+                pages.append((i, text[:MAX_FILE_CHARS]))
+    except ValueError:
+        raise
+    except Exception as e:
+        # Corrupt/truncated PDFs raise pypdf errors (e.g. PdfStreamError),
+        # which must surface as a clean 400, never a raw 500 (proxies turn
+        # those into opaque HTTP 502s).
+        raise ValueError(f"Could not read the PDF file: {e}") from e
     if not pages:
         # no text layer anywhere -> OCR before giving up (scanned documents)
         pages = _pdf_ocr_fallback(data)
@@ -126,28 +134,33 @@ def _parse_pptx(data: bytes) -> str:
         prs = Presentation(io.BytesIO(data))
     except Exception as e:
         raise ValueError(f"Could not read the PowerPoint file: {e}") from e
-    parts = []
-    for idx, slide in enumerate(prs.slides, 1):
-        texts = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                t = "\n".join(p.text for p in shape.text_frame.paragraphs if p.text.strip())
-                if t.strip():
-                    texts.append(t.strip())
-            if getattr(shape, "has_table", False) and shape.has_table:
-                for row in shape.table.rows:
-                    line = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
-                    if line:
-                        texts.append(line)
-        notes = ""
-        if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
-            notes = slide.notes_slide.notes_text_frame.text.strip()
-        if not (texts or notes):
-            continue
-        block = f"[Slide {idx}]\n" + "\n".join(texts)
-        if notes:
-            block += f"\n(Speaker notes: {notes})"
-        parts.append(block)
+    try:
+        parts = []
+        for idx, slide in enumerate(prs.slides, 1):
+            texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    t = "\n".join(p.text for p in shape.text_frame.paragraphs if p.text.strip())
+                    if t.strip():
+                        texts.append(t.strip())
+                if getattr(shape, "has_table", False) and shape.has_table:
+                    for row in shape.table.rows:
+                        line = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
+                        if line:
+                            texts.append(line)
+            notes = ""
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+            if not (texts or notes):
+                continue
+            block = f"[Slide {idx}]\n" + "\n".join(texts)
+            if notes:
+                block += f"\n(Speaker notes: {notes})"
+            parts.append(block)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Could not read the PowerPoint file: {e}") from e
     return "\n\n".join(parts)
 
 
@@ -161,7 +174,9 @@ def _parse_odt(data: bytes) -> str:
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             with z.open("content.xml") as f:
                 tree = ET.parse(f)
-    except (KeyError, ET.ParseError, zipfile.BadZipFile) as e:
+    except ValueError:
+        raise
+    except Exception as e:
         raise ValueError(f"Could not read the OpenDocument file: {e}") from e
     root = tree.getroot()
     body = root.find(".//{urn:oasis:names:tc:opendocument:xmlns:office:1.0}body")
@@ -305,7 +320,14 @@ def _parse_json(text: str) -> str:
 
 
 def _parse_docx(data: bytes) -> str:
-    doc = _Docx(io.BytesIO(data))
+    try:
+        doc = _Docx(io.BytesIO(data))
+    except ValueError:
+        raise
+    except Exception as e:
+        # A non-docx file renamed to .docx raises BadZipFile here — clean
+        # 400, never a raw 500 (see _parse_pdf).
+        raise ValueError(f"Could not read the Word file: {e}") from e
     parts = []
     for child in doc.element.body.iterchildren():
         if child.tag == qn("w:p"):

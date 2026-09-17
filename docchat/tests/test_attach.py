@@ -260,6 +260,45 @@ def test_embed_state_reports_the_cache_and_reason():
     assert st["state"] == "ready" or st["state"] == "cold" or st["state"].startswith("error"), st
 
 
+def test_upload_endpoints_return_400_json_for_corrupt_files_not_500():
+    """End-to-end upload contract: corrupt files must be HTTP 400 with a JSON
+    detail, never a raw 500 — hosting proxies surface bare 500s as opaque
+    HTTP 502s, which is what users saw on every bad upload."""
+    import server
+    from fastapi.testclient import TestClient
+    from ragchat import llm
+
+    def _embed(texts):
+        return np.array([_embed_one() for _ in texts], dtype=np.float32)
+
+    def _embed_one():
+        v = np.ones(8, dtype=np.float32)
+        return v / np.linalg.norm(v)
+
+    real_db, real_embed = server.DB, llm.embed_texts
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Store(os.path.join(td, "t.db"))
+        server.DB, llm.embed_texts = tmp, _embed
+        try:
+            client = TestClient(server.app, raise_server_exceptions=False)
+            corrupt = [
+                ("broken.pdf", b"%PDF-1.4 garbage not a real pdf trailer", "application/pdf"),
+                ("broken.docx", b"PK not a real docx content at all",
+                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            ]
+            for url in ("/api/docs", "/api/attach"):
+                for name, data, mt in corrupt:
+                    r = client.post(url, files={"file": (name, data, mt)})
+                    assert r.status_code == 400, (url, name, r.status_code, r.text[:200])
+                    assert r.json().get("detail"), (url, name, r.text[:200])
+            # ...and a valid upload on the same endpoints still succeeds
+            r = client.post("/api/docs", files={"file": ("ok.txt", b"hello world", "text/plain")})
+            assert r.status_code == 200, r.text[:200]
+        finally:
+            server.DB, llm.embed_texts = real_db, real_embed
+            tmp.close()
+
+
 def test_doc_stats_descriptor():
     from ragchat import parsing
 

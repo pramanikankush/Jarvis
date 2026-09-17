@@ -129,6 +129,36 @@ def test_odt_corrupt_raises_valueerror():
         assert "OpenDocument" in str(e)
 
 
+def test_corrupt_pdf_raises_valueerror_not_pypdf_error():
+    """A truncated/garbage PDF raised pypdf's PdfStreamError past the upload
+    handler (which only caught ValueError) -> raw 500 -> opaque HTTP 502
+    behind hosting proxies. It must be a clean ValueError (HTTP 400)."""
+    try:
+        parsing.parse("broken.pdf", b"%PDF-1.4 garbage not a real pdf trailer")
+        assert False, "should have raised"
+    except ValueError as e:
+        assert "PDF" in str(e)
+
+
+def test_corrupt_docx_raises_valueerror_not_zip_error():
+    """A non-zip file renamed to .docx raised BadZipFile past the upload
+    handler -> raw 500. Must be a clean ValueError (HTTP 400)."""
+    try:
+        parsing.parse("broken.docx", b"PK not a real docx content at all")
+        assert False, "should have raised"
+    except ValueError as e:
+        assert "Word" in str(e)
+
+
+def test_corrupt_pptx_raises_valueerror():
+    """Same contract as docx: garbage .pptx bytes are a 400, never a 500."""
+    try:
+        parsing.parse("broken.pptx", b"PK junk not a presentation")
+        assert False, "should have raised"
+    except ValueError as e:
+        assert "PowerPoint" in str(e)
+
+
 def test_unsupported_extension_lists_allowed():
     try:
         parsing.parse("file.xyz", b"data")
