@@ -55,6 +55,36 @@ def test_zero_limit_disables_cap():
     assert server.chat_limit_reached(st, "guest:device-abc", limit=0) is False
 
 
+def test_warm_up_policy_respects_env_and_free_memory():
+    """The embedding model holds ~200 MB resident, so a 512 MB host must not
+    preload it: an explicit DOCCHAT_WARM_EMBEDDINGS wins, else free memory does."""
+    saved_env = os.environ.pop("DOCCHAT_WARM_EMBEDDINGS", None)
+    saved_free = server.available_memory_mb
+    try:
+        server.available_memory_mb = lambda: None       # unknown -> dev machine
+        assert server.warm_up_enabled() is True
+        server.available_memory_mb = lambda: 2000.0
+        assert server.warm_up_enabled() is True
+        server.available_memory_mb = lambda: 300.0      # a 512 MB free tier
+        assert server.warm_up_enabled() is False
+        os.environ["DOCCHAT_WARM_EMBEDDINGS"] = "1"
+        assert server.warm_up_enabled() is True         # explicit force wins
+        os.environ["DOCCHAT_WARM_EMBEDDINGS"] = "0"
+        server.available_memory_mb = lambda: 8000.0
+        assert server.warm_up_enabled() is False        # explicit disable wins
+    finally:
+        server.available_memory_mb = saved_free
+        os.environ.pop("DOCCHAT_WARM_EMBEDDINGS", None)
+        if saved_env is not None:
+            os.environ["DOCCHAT_WARM_EMBEDDINGS"] = saved_env
+
+
+def test_sheet_stack_is_not_imported_by_the_server():
+    """pandas + matplotlib are ~94 MB resident, so the chat/upload paths must not
+    pay for them — the sheet endpoints import the module on first use instead."""
+    assert not hasattr(server, "spreadsheet"), "server imports pandas/matplotlib eagerly again"
+
+
 def test_limit_is_per_user():
     a = _fresh_store("guest:aaa")
     b = _fresh_store("guest:bbb")

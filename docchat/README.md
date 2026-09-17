@@ -76,7 +76,8 @@ be exported in your shell.
 | `GROQ_TTS_VOICE` | `troy` | Default TTS voice |
 | `DOCCHAT_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Local embedding model |
 | `FASTEMBED_CACHE` | `data/models` | Where the embedding model is cached (persistent volume!) |
-| `DOCCHAT_WARM_EMBEDDINGS` | `1` | Load the embedding model at startup (set `0` to skip) |
+| `DOCCHAT_WARM_EMBEDDINGS` | auto | Load the embedding model at startup; `1` forces, `0` skips |
+| `DOCCHAT_WARM_MIN_MB` | `700` | Free memory required to auto-warm (small hosts skip it) |
 | `PORT` | 8000 | Server port |
 
 ## Architecture
@@ -178,6 +179,15 @@ without the OCR stack installed, image OCR, corrupt-file errors).
 
 ## Notes & limits
 
+- **Memory is the real deployment constraint.** Measured resident footprint:
+  importing the server is ~54 MB (pandas/matplotlib are imported lazily, only
+  for spreadsheets), the ONNX embedding model adds ~200 MB, and a spreadsheet
+  or an OCR upload adds ~90 MB / ~150 MB more. A 512 MB instance (e.g. Render's
+  free tier) works for chat + document upload, but an OCR/scanned upload under
+  memory pressure can get the worker OOM-killed — which the proxy reports as
+  HTTP 502 (connection died mid-request) or 503 (no healthy instance). Set
+  `DOCCHAT_WARM_EMBEDDINGS=0` there, and give the service a disk for `data/` or
+  every restart/deploy starts with an empty workspace.
 - **Attachments failing with HTTP 503** mean the local embedding model could not
   start, not that the file type is unsupported (parsing problems return 400).
   Every upload embeds its chunks with `bge-small`, which is downloaded once

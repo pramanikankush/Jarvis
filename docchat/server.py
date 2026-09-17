@@ -17,7 +17,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from ragchat import agent as agent_mod  # noqa: E402
-from ragchat import auth, ingest, llm, parsing, spreadsheet, store, usagetrack, websearch  # noqa: E402
+from ragchat import auth, ingest, llm, parsing, store, usagetrack, websearch  # noqa: E402
+# NOTE: ragchat.spreadsheet (pandas + matplotlib, ~94 MB resident) is imported
+# lazily inside the two sheet endpoints and the agent's spreadsheet tool — the
+# chat/upload paths never need it, and on a 512 MB instance that memory decides
+# whether a request survives.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("jarvis.server")
@@ -76,6 +80,38 @@ def save_config() -> None:
 
 load_config()
 
+# The embedding model costs ~200 MB resident (measured); warming it up trades
+# first-request latency against memory, so on a small host (Render's free tier
+# has 512 MB) we leave it to the first upload/search instead of holding that
+# memory for the whole life of the container.
+WARM_MIN_MB = float(os.environ.get("DOCCHAT_WARM_MIN_MB", "700") or "700")
+
+
+def available_memory_mb() -> float | None:
+    """Available RAM in MB, or None when it cannot be determined (non-Linux)."""
+    try:
+        values: dict[str, float] = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                values[key.strip()] = float(rest.strip().split()[0]) / 1024.0  # kB -> MB
+        return values.get("MemAvailable") or values.get("MemFree")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def warm_up_enabled() -> bool:
+    """Whether to load the embedding model at startup. An explicit
+    DOCCHAT_WARM_EMBEDDINGS wins; otherwise warm only when the host has
+    headroom (unknown -> a dev machine, so warm)."""
+    flag = os.environ.get("DOCCHAT_WARM_EMBEDDINGS", "").strip().lower()
+    if flag in ("0", "false", "no"):
+        return False
+    if flag in ("1", "true", "yes"):
+        return True
+    free = available_memory_mb()
+    return True if free is None else free >= WARM_MIN_MB
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -85,13 +121,20 @@ async def lifespan(_app: FastAPI):
     where it stalled for 40 s+ and surfaced as an HTTP 503 on attachments
     (pdf/docx included — the trigger is the model, not the file type). Doing it
     here makes the first upload fast and lets /api/state report the real state.
-    Set DOCCHAT_WARM_EMBEDDINGS=0 to skip (e.g. an image that pre-caches it).
+    Skipped on memory-constrained hosts (DOCCHAT_WARM_EMBEDDINGS=0 disables it
+    anywhere, DOCCHAT_WARM_MIN_MB tunes the free-memory threshold).
     """
     warm = None
-    if os.environ.get("DOCCHAT_WARM_EMBEDDINGS", "1") not in ("0", "false", "no"):
+    if warm_up_enabled():
         log.info("warming the local embedding model in the background (cache: %s)",
                  llm.embed_cache_dir())
         warm = asyncio.create_task(asyncio.to_thread(llm.warm_embeddings))
+    else:
+        free = available_memory_mb()
+        log.info("embedding warm-up skipped (%s, DOCCHAT_WARM_EMBEDDINGS=%r) — the model "
+                 "loads on the first upload or document search",
+                 "free memory unknown" if free is None else f"{free:.0f} MB free",
+                 os.environ.get("DOCCHAT_WARM_EMBEDDINGS", ""))
     try:
         yield
     finally:
@@ -317,6 +360,8 @@ async def attach_doc(request: Request):
 # ---------------- spreadsheets ----------------
 @app.post("/api/sheets")
 async def upload_sheet(request: Request):
+    from ragchat import spreadsheet  # lazy: pandas+matplotlib are heavy
+
     db = scoped(request)
     form = await request.form()
     up = form.get("file")
@@ -377,6 +422,7 @@ async def sheet_chart(sid: int, request: Request, type: str = "bar", column: str
         raise HTTPException(404, "Spreadsheet not found")
     if type not in ("bar", "line", "hist", "box"):
         raise HTTPException(400, f"Unknown chart type '{type}' (bar|line|hist|box)")
+    from ragchat import spreadsheet  # lazy: pandas+matplotlib are heavy
     try:
         df = await asyncio.to_thread(spreadsheet.load_sheet, path, os.path.splitext(path)[1].lower())
         if type != "box" and not column:

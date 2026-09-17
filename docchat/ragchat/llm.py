@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 
 import httpx
@@ -103,6 +104,7 @@ _embedder = None
 _embed_state = "cold"  # cold | loading | ready | error: <reason>
 _embed_fatal = False  # True only when retrying cannot help (fastembed missing)
 _embed_failed_at = 0.0  # monotonic time of the last failed load
+_embed_lock = threading.Lock()  # one load at a time (see _get_embedder)
 # A failed load spends ~40 s retrying the download; answering every following
 # upload with that same stall would hit proxy timeouts and hide the reason.
 # For this many seconds uploads fail fast with the cached reason instead, then
@@ -178,22 +180,28 @@ def _get_embedder():
         raise RuntimeError(
             "'fastembed' is not installed. Run: pip install -r requirements.txt"
         )
-    if _embed_failed_at and time.monotonic() - _embed_failed_at < EMBED_RETRY_AFTER:
-        left = int(EMBED_RETRY_AFTER - (time.monotonic() - _embed_failed_at)) + 1
-        raise RuntimeError(f"{embed_error()} (retrying in ~{left}s)")
-    _embed_state = "loading"
-    try:
-        _embedder = _load_embedder()
-    except Exception as e:
-        # Record the real reason (the UI shows it instead of a bare 503) but
-        # stay retryable: a download that failed while offline must be able to
-        # succeed once the machine is online again.
-        _embed_state = f"error: {e}"
-        _embed_failed_at = time.monotonic()
-        raise
-    _embed_state = "ready"
-    _embed_failed_at = 0.0
-    return _embedder
+    # One load at a time: the model is ~200 MB resident, so a startup warm-up
+    # and a concurrent upload/chat must wait for the in-flight load instead of
+    # building a second copy and doubling the peak (which OOMs small instances).
+    with _embed_lock:
+        if _embedder is not None:  # another caller finished while we waited
+            return _embedder
+        if _embed_failed_at and time.monotonic() - _embed_failed_at < EMBED_RETRY_AFTER:
+            left = int(EMBED_RETRY_AFTER - (time.monotonic() - _embed_failed_at)) + 1
+            raise RuntimeError(f"{embed_error()} (retrying in ~{left}s)")
+        _embed_state = "loading"
+        try:
+            _embedder = _load_embedder()
+        except Exception as e:
+            # Record the real reason (the UI shows it instead of a bare 503) but
+            # stay retryable: a download that failed while offline must be able
+            # to succeed once the machine is online again.
+            _embed_state = f"error: {e}"
+            _embed_failed_at = time.monotonic()
+            raise
+        _embed_state = "ready"
+        _embed_failed_at = 0.0
+        return _embedder
 
 
 def warm_embeddings() -> bool:
