@@ -98,11 +98,11 @@ def _lines_from_result(result) -> list[str]:
 
 def ocr_image(img: np.ndarray) -> str:
     """Run OCR on an RGB uint8 image array; return the recognized lines
-    joined with newlines ("" when nothing is recognized)."""
-    engine = _get_engine()
+    joined with newlines ("" when nothing is recognized, or when the engine
+    itself cannot start — this module never raises past a logged warning)."""
     try:
-        result = _call_engine(engine, img)
-    except Exception as e:  # engine-level failure (corrupt frame, model error)
+        result = _call_engine(_get_engine(), img)
+    except Exception as e:  # engine load or frame failure
         log.warning("ocr_image failed: %s", e)
         return ""
     return "\n".join(_lines_from_result(result))

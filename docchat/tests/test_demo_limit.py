@@ -55,6 +55,59 @@ def test_zero_limit_disables_cap():
     assert server.chat_limit_reached(st, "guest:device-abc", limit=0) is False
 
 
+def test_bad_numeric_env_vars_do_not_break_startup():
+    """A typo'd numeric env var must not stop the app from booting (that would
+    be a 503 on every endpoint); it warns and falls back."""
+    saved = os.environ.get("DOCCHAT_WARM_MIN_MB")
+    try:
+        os.environ["DOCCHAT_WARM_MIN_MB"] = "seven hundred"
+        assert server.env_number("DOCCHAT_WARM_MIN_MB", 700) == 700
+        os.environ["DOCCHAT_WARM_MIN_MB"] = "900"
+        assert server.env_number("DOCCHAT_WARM_MIN_MB", 700) == 900
+        os.environ["DOCCHAT_WARM_MIN_MB"] = ""
+        assert server.env_number("DOCCHAT_WARM_MIN_MB", 700) == 700
+        assert server.env_number("NOT_SET_ANYWHERE", 5) == 5
+    finally:
+        os.environ.pop("DOCCHAT_WARM_MIN_MB", None)
+        if saved is not None:
+            os.environ["DOCCHAT_WARM_MIN_MB"] = saved
+
+
+def test_memory_headroom_uses_the_container_budget_not_the_host():
+    """In a container /proc/meminfo reports the host's RAM, so a 512 MB plan
+    would look roomy and pin ~200 MB of embedding model it cannot afford."""
+    saved = (server.CGROUP_LIMIT_PATHS, server.CGROUP_USED_PATHS, server.host_free_memory_mb)
+    saved_env = os.environ.pop("DOCCHAT_WARM_EMBEDDINGS", None)
+    saved_min = server.WARM_MIN_MB
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            limit = os.path.join(td, "memory.max")
+            used = os.path.join(td, "memory.current")
+            with open(limit, "w", encoding="utf-8") as f:
+                f.write("536870912")  # 512 MB plan
+            with open(used, "w", encoding="utf-8") as f:
+                f.write("83886080")  # 80 MB already used
+            server.CGROUP_LIMIT_PATHS = (limit,)
+            server.CGROUP_USED_PATHS = (used,)
+            server.host_free_memory_mb = lambda: 30000.0  # the host has 30 GB free
+            server.WARM_MIN_MB = 700.0
+            free = server.available_memory_mb()
+            assert free is not None and 420 <= free <= 440, free  # 512 - 80 MB
+            assert server.warm_up_enabled() is False
+            # an unlimited cgroup ("max") falls back to the host figure
+            with open(limit, "w", encoding="utf-8") as f:
+                f.write("max")
+            assert server.available_memory_mb() == 30000.0
+            # and a roomy box still warms up
+            server.host_free_memory_mb = lambda: 4000.0
+            assert server.warm_up_enabled() is True
+    finally:
+        (server.CGROUP_LIMIT_PATHS, server.CGROUP_USED_PATHS, server.host_free_memory_mb) = saved
+        server.WARM_MIN_MB = saved_min
+        if saved_env is not None:
+            os.environ["DOCCHAT_WARM_EMBEDDINGS"] = saved_env
+
+
 def test_warm_up_policy_respects_env_and_free_memory():
     """The embedding model holds ~200 MB resident, so a 512 MB host must not
     preload it: an explicit DOCCHAT_WARM_EMBEDDINGS wins, else free memory does."""

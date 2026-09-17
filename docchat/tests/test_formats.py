@@ -232,6 +232,25 @@ def test_ocr_result_shapes_across_rapidocr_versions():
     assert ocr._lines_from_result(None) == []
 
 
+def test_ocr_engine_failure_returns_empty_not_raises():
+    """Contract: OCR is a fallback that never raises. A failing engine (missing
+    or corrupt models, OOM while loading) must yield "" so the caller reports
+    "no readable text" instead of turning into a 500."""
+    import numpy as np
+
+    saved = ocr._get_engine
+
+    def _boom():
+        raise RuntimeError("engine unavailable")
+
+    ocr._get_engine = _boom
+    try:
+        blank = np.zeros((8, 8, 3), dtype=np.uint8)
+        assert ocr.ocr_image(blank) == ""
+    finally:
+        ocr._get_engine = saved
+
+
 def test_doc_stats_new_kinds():
     assert parsing.doc_stats("d.pptx")["kind"] == "powerpoint"
     assert parsing.doc_stats("d.json")["kind"] == "json"

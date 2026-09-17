@@ -109,7 +109,19 @@ _embed_lock = threading.Lock()  # one load at a time (see _get_embedder)
 # upload with that same stall would hit proxy timeouts and hide the reason.
 # For this many seconds uploads fail fast with the cached reason instead, then
 # the load is genuinely retried so an offline machine recovers by itself.
-EMBED_RETRY_AFTER = float(os.environ.get("DOCCHAT_EMBED_RETRY_AFTER", "60") or "60")
+def _env_number(name: str, default: float) -> float:
+    """A numeric env var that cannot break startup: a typo logs and falls back."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number — using %s", name, raw, default)
+        return default
+
+
+EMBED_RETRY_AFTER = _env_number("DOCCHAT_EMBED_RETRY_AFTER", 60)
 
 
 def _has_cache(path: str) -> bool:

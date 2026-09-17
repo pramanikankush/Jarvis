@@ -26,6 +26,21 @@ from ragchat import auth, ingest, llm, parsing, store, usagetrack, websearch  # 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("jarvis.server")
 
+
+def env_number(name: str, default: float) -> float:
+    """A numeric environment variable, with a warning instead of a crash on a
+    typo: a bad value must never stop the app from starting (that would be a 503
+    for every endpoint). Unset or blank falls back to `default`."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number — using %s", name, raw, default)
+        return default
+
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(ROOT, "static")
 CONFIG_PATH = os.path.join(store.DATA_DIR, "config.json")
@@ -35,7 +50,7 @@ MAX_SHEET_BYTES = 20 * 1024 * 1024
 # Free-demo chat limit: guests and Clerk users may keep at most this many
 # chats. 0 = unlimited. The local workspace (owner) is never limited, so
 # pre-existing local workflows are unaffected. Set DEMO_MAX_CHATS=0 to disable.
-DEMO_MAX_CHATS = int(os.environ.get("DEMO_MAX_CHATS", "3") or "0")
+DEMO_MAX_CHATS = int(env_number("DEMO_MAX_CHATS", 3))
 
 DB = store.Store()
 _config = {"groq_key": "", "model": llm.DEFAULT_MODEL, "tts_voice": llm.TTS_VOICE,
@@ -84,11 +99,38 @@ load_config()
 # first-request latency against memory, so on a small host (Render's free tier
 # has 512 MB) we leave it to the first upload/search instead of holding that
 # memory for the whole life of the container.
-WARM_MIN_MB = float(os.environ.get("DOCCHAT_WARM_MIN_MB", "700") or "700")
+WARM_MIN_MB = env_number("DOCCHAT_WARM_MIN_MB", 700)
+
+# Inside a container /proc/meminfo reports the *host's* RAM, so a 512 MB plan
+# looks like it has GBs free. Read the cgroup budget (v2 first, then v1) and
+# take whichever headroom is smaller.
+CGROUP_LIMIT_PATHS = ("/sys/fs/cgroup/memory.max",
+                      "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+CGROUP_USED_PATHS = ("/sys/fs/cgroup/memory.current",
+                     "/sys/fs/cgroup/memory/memory.usage_in_bytes")
+_UNLIMITED_BYTES = 1 << 62  # cgroup v1 signals "no limit" with a huge number
 
 
-def available_memory_mb() -> float | None:
-    """Available RAM in MB, or None when it cannot be determined (non-Linux)."""
+def read_bytes(paths: tuple[str, ...]) -> int | None:
+    """First parsable byte value in `paths`; None when unreadable or unlimited."""
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+        except OSError:
+            continue
+        if raw in ("", "max"):
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        return value if value < _UNLIMITED_BYTES else None
+    return None
+
+
+def host_free_memory_mb() -> float | None:
+    """Free RAM from /proc/meminfo in MB, or None when unavailable."""
     try:
         values: dict[str, float] = {}
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
@@ -100,14 +142,29 @@ def available_memory_mb() -> float | None:
         return None
 
 
+def available_memory_mb() -> float | None:
+    """Headroom for this process in MB: the container's cgroup budget when
+    there is one, else the host's free memory. None when neither is readable
+    (Windows/macOS — treated as a roomy dev machine)."""
+    candidates: list[float] = []
+    limit = read_bytes(CGROUP_LIMIT_PATHS)
+    if limit is not None:
+        used = read_bytes(CGROUP_USED_PATHS) or 0
+        candidates.append(max(0.0, (limit - used) / 1048576.0))
+    free = host_free_memory_mb()
+    if free is not None:
+        candidates.append(free)
+    return min(candidates) if candidates else None
+
+
 def warm_up_enabled() -> bool:
     """Whether to load the embedding model at startup. An explicit
     DOCCHAT_WARM_EMBEDDINGS wins; otherwise warm only when the host has
     headroom (unknown -> a dev machine, so warm)."""
     flag = os.environ.get("DOCCHAT_WARM_EMBEDDINGS", "").strip().lower()
-    if flag in ("0", "false", "no"):
+    if flag in ("0", "false", "no", "off"):
         return False
-    if flag in ("1", "true", "yes"):
+    if flag in ("1", "true", "yes", "on"):
         return True
     free = available_memory_mb()
     return True if free is None else free >= WARM_MIN_MB
@@ -358,10 +415,23 @@ async def attach_doc(request: Request):
 
 
 # ---------------- spreadsheets ----------------
+def sheet_module():
+    """ragchat.spreadsheet on demand — pandas + matplotlib are ~94 MB resident
+    and only the sheet endpoints need them. A missing optional stack is reported
+    as a clear message rather than a crash (spec: failure handling)."""
+    try:
+        from ragchat import spreadsheet
+
+        return spreadsheet
+    except ImportError as e:
+        raise HTTPException(
+            400, f"Spreadsheet support is unavailable ({e}). Run: pip install -r requirements.txt"
+        ) from e
+
+
 @app.post("/api/sheets")
 async def upload_sheet(request: Request):
-    from ragchat import spreadsheet  # lazy: pandas+matplotlib are heavy
-
+    spreadsheet = sheet_module()
     db = scoped(request)
     form = await request.form()
     up = form.get("file")
@@ -422,7 +492,7 @@ async def sheet_chart(sid: int, request: Request, type: str = "bar", column: str
         raise HTTPException(404, "Spreadsheet not found")
     if type not in ("bar", "line", "hist", "box"):
         raise HTTPException(400, f"Unknown chart type '{type}' (bar|line|hist|box)")
-    from ragchat import spreadsheet  # lazy: pandas+matplotlib are heavy
+    spreadsheet = sheet_module()
     try:
         df = await asyncio.to_thread(spreadsheet.load_sheet, path, os.path.splitext(path)[1].lower())
         if type != "box" and not column:
