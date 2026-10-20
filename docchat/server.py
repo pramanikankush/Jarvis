@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from ragchat import agent as agent_mod  # noqa: E402
-from ragchat import auth, ingest, llm, parsing, store, usagetrack, websearch  # noqa: E402
+from ragchat import auth, ingest, llm, parsing, projects, signing, store, usagetrack, websearch  # noqa: E402
 # NOTE: ragchat.spreadsheet (pandas + matplotlib, ~94 MB resident) is imported
 # lazily inside the two sheet endpoints and the agent's spreadsheet tool — the
 # chat/upload paths never need it, and on a 512 MB instance that memory decides
@@ -47,6 +47,8 @@ CONFIG_PATH = os.path.join(store.DATA_DIR, "config.json")
 SHEETS_DIR = os.path.join(store.DATA_DIR, "sheets")
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_SHEET_BYTES = 20 * 1024 * 1024
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+MAX_PROJECT_BYTES = 100 * 1024 * 1024
 # Free-demo chat limit: guests and Clerk users may keep at most this many
 # chats. 0 = unlimited. The local workspace (owner) is never limited, so
 # pre-existing local workflows are unaffected. Set DEMO_MAX_CHATS=0 to disable.
@@ -201,6 +203,39 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Jarvis", lifespan=lifespan)
 
+# Public API surface: health probes and the config/state snapshot used by the
+# landing page. Every other /api route requires identity in AUTH_MODE=required.
+PUBLIC_API_PATHS = {"/api/health", "/api/state"}
+
+
+@app.middleware("http")
+async def auth_gate(request: Request, call_next):
+    """Resolve identity once per request and fail closed in required mode.
+
+    `resolve_user` may do a network JWKS fetch, so it runs in a worker thread."""
+    path = request.url.path
+    if path.startswith("/api/") and path not in PUBLIC_API_PATHS and not path.startswith("/api/auth/"):
+        try:
+            request.state.user = await asyncio.to_thread(
+                auth.resolve_user,
+                request.headers.get("Authorization", ""),
+                request.headers.get("X-Guest-Id", ""),
+            )
+        except auth.AuthError as e:
+            return JSONResponse(status_code=401, content={
+                "detail": str(e), "code": "unauthorized",
+            })
+    elif path == "/api/state":
+        try:
+            request.state.user = await asyncio.to_thread(
+                auth.resolve_user,
+                request.headers.get("Authorization", ""),
+                request.headers.get("X-Guest-Id", ""),
+            )
+        except auth.AuthError:
+            request.state.user = None
+    return await call_next(request)
+
 
 def sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -218,6 +253,22 @@ async def json_body(request: Request) -> dict:
     except Exception:
         raise HTTPException(400, "Invalid JSON request body.")
     return body if isinstance(body, dict) else {}
+
+
+async def read_upload(up, max_bytes: int) -> bytes:
+    """Read an UploadFile in bounded chunks; refuse oversized bodies before
+    they are fully materialized in memory."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await up.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(413, f"File too large (max {max_bytes // (1024 * 1024)} MB)")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def get_key() -> str:
@@ -251,7 +302,16 @@ def chat_limit_reached(db, uid: str, limit: int = DEMO_MAX_CHATS) -> bool:
 
 
 def identity(request: Request) -> auth.User:
-    """Resolve the current user from request headers (clerk > guest > local)."""
+    """Return the identity resolved by the auth middleware.
+
+    A missing identity on a public route raises AuthError; /api/state catches
+    it and returns only the non-user-specific snapshot.
+    """
+    if hasattr(request.state, "user"):
+        user = request.state.user
+        if user is None:
+            raise auth.AuthError("Authentication required.")
+        return user
     return auth.resolve_user(
         authorization=request.headers.get("Authorization", ""),
         guest_id=request.headers.get("X-Guest-Id", ""),
@@ -276,6 +336,12 @@ def sheet_filepath(sid: int, ext: str) -> str:
 
 
 # ---------------- identity & state ----------------
+@app.get("/api/health")
+async def health():
+    """Unauthenticated liveness probe. Never returns keys or user data."""
+    return {"ok": True, "embedding": llm.embed_state()}
+
+
 @app.get("/api/me")
 async def api_me(request: Request):
     """The current identity: uid (stable workspace key), source, name.
@@ -283,9 +349,8 @@ async def api_me(request: Request):
     return {"me": identity(request).to_dict(), "clerk_enabled": auth.clerk_enabled()}
 
 
-@app.get("/api/state")
-async def api_state(request: Request):
-    db = scoped(request)
+def _public_state() -> dict:
+    """The non-user-specific part of /api/state, safe without credentials."""
     return {
         "key_set": bool(_config["groq_key"]),
         "tavily_set": bool(_config.get("tavily_key")),
@@ -294,18 +359,45 @@ async def api_state(request: Request):
         "tts_voice": _config.get("tts_voice") or llm.TTS_VOICE,
         "voices": llm.TTS_VOICES,
         "usage": usagetrack.report(_config.get("model") or llm.DEFAULT_MODEL),
-        "me": identity(request).to_dict(),
+        "me": None,
         "clerk_enabled": auth.clerk_enabled(),
         "clerk_pk": auth.CLERK_PUBLISHABLE_KEY if auth.clerk_enabled() else "",
-        "clerk_domain": auth._publishable_domain() if auth.clerk_enabled() else "",
+        "clerk_domain": auth.publishable_domain() if auth.clerk_enabled() else "",
+        "images_enabled": _config.get("images_enabled", True),
+        "demo_max_chats": 0,
+        "auth_required": True,
+    }
+
+
+@app.get("/api/state")
+async def api_state(request: Request):
+    try:
+        user = identity(request)
+    except auth.AuthError:
+        return _public_state()
+    db = DB.for_user(user.uid)
+    return {
+        "key_set": bool(_config["groq_key"]),
+        "tavily_set": bool(_config.get("tavily_key")),
+        "embedding": llm.embed_state(),
+        "model": _config.get("model") or llm.DEFAULT_MODEL,
+        "tts_voice": _config.get("tts_voice") or llm.TTS_VOICE,
+        "voices": llm.TTS_VOICES,
+        "usage": usagetrack.report(_config.get("model") or llm.DEFAULT_MODEL),
+        "me": user.to_dict(),
+        "clerk_enabled": auth.clerk_enabled(),
+        "clerk_pk": auth.CLERK_PUBLISHABLE_KEY if auth.clerk_enabled() else "",
+        "clerk_domain": auth.publishable_domain() if auth.clerk_enabled() else "",
         "docs": db.list_docs(),
         "sessions": db.list_sessions(),
         "sheets": db.list_sheets(),
+        "projects": db.list_projects(),
         "memory_count": len(db.list_memory()),
         "open_tasks": len(db.list_tasks(include_done=False)),
         "note_count": len(db.list_notes()),
         "images_enabled": _config.get("images_enabled", True),
-        "demo_max_chats": DEMO_MAX_CHATS if identity(request).uid else 0,
+        "demo_max_chats": DEMO_MAX_CHATS if user.uid else 0,
+        "auth_required": auth.auth_mode() == "required",
     }
 
 
@@ -326,6 +418,9 @@ async def get_config(request: Request):
 
 @app.post("/api/config")
 async def post_config(request: Request):
+    user = identity(request)
+    if not user.is_owner:
+        raise HTTPException(403, "Only the workspace owner can change global settings.")
     body = await json_body(request)
     if "groq_key" in body:
         _config["groq_key"] = (body.get("groq_key") or "").strip()
@@ -365,9 +460,7 @@ async def upload_doc(request: Request):
     name = os.path.basename(str(up.filename).replace("\\", "/"))
     if not name:
         raise HTTPException(400, "Empty filename")
-    data = await up.read()
-    if len(data) > MAX_FILE_BYTES:
-        raise HTTPException(413, f"File too large (max {MAX_FILE_BYTES // (1024 * 1024)} MB)")
+    data = await read_upload(up, MAX_FILE_BYTES)
     try:
         doc, _chunks = await ingest.ingest_doc(db, name, data)
     except ingest.EmbedError as e:
@@ -404,11 +497,9 @@ async def attach_doc(request: Request):
     name = os.path.basename(str(up.filename).replace("\\", "/"))
     if not name:
         raise HTTPException(400, "Empty filename")
-    data = await up.read()
+    data = await read_upload(up, MAX_FILE_BYTES)
     if not data:
         raise HTTPException(400, "The attached file is empty")
-    if len(data) > MAX_FILE_BYTES:
-        raise HTTPException(413, f"File too large (max {MAX_FILE_BYTES // (1024 * 1024)} MB)")
     try:
         doc, chunk_count = await ingest.ingest_doc(db, name, data)
     except ingest.EmbedError as e:
@@ -422,6 +513,117 @@ async def attach_doc(request: Request):
     stats = parsing.doc_stats(doc["name"])
     return JSONResponse({"ok": True, "doc": doc, "chunks": chunk_count,
                          "stats": stats, "docs": db.list_docs()})
+
+
+# ---------------- projects ----------------
+@app.get("/api/projects")
+async def list_projects(request: Request):
+    return {"projects": scoped(request).list_projects()}
+
+
+@app.post("/api/projects")
+async def create_project(request: Request):
+    """Import a project from a .zip/.tar archive and index its source files."""
+    db = scoped(request)
+    form = await request.form()
+    up = form.get("file")
+    if not up or not up.filename:
+        raise HTTPException(400, "No project archive received")
+    filename = os.path.basename(str(up.filename).replace("\\", "/"))
+    if not filename:
+        raise HTTPException(400, "Empty filename")
+    name = (str(form.get("name") or os.path.splitext(filename)[0]).strip() or "Project")[:120]
+    data = await read_upload(up, MAX_PROJECT_BYTES)
+    if not data:
+        raise HTTPException(400, "The project archive is empty")
+    try:
+        result = await asyncio.to_thread(
+            projects.create_from_archive, db, name, filename, data, llm.embed_texts)
+    except projects.ProjectEmbedError as e:
+        raise embed_503(e)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.exception("project import failed: %s", filename)
+        raise HTTPException(500, f"Could not import project: {e}")
+    return JSONResponse({"ok": True, **result, "projects": db.list_projects()})
+
+
+@app.get("/api/projects/{pid}")
+async def get_project(pid: str, request: Request):
+    db = scoped(request)
+    project = db.get_project(pid)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    return {
+        "project": project,
+        "instruction": db.active_instruction(pid),
+        "file_count": len(db.list_project_files(pid)),
+        "chunks": db.project_total_chunks(pid),
+    }
+
+
+@app.patch("/api/projects/{pid}")
+async def patch_project(pid: str, request: Request):
+    db = scoped(request)
+    if not db.get_project(pid):
+        raise HTTPException(404, "Project not found")
+    body = await json_body(request)
+    name = (body.get("name") or "").strip()
+    updated = db.update_project(pid, name=name[:120] if name else None)
+    return {"ok": True, "project": updated}
+
+
+@app.delete("/api/projects/{pid}")
+async def delete_project(pid: str, request: Request):
+    db = scoped(request)
+    if not await asyncio.to_thread(projects.delete_project, db, pid):
+        raise HTTPException(404, "Project not found")
+    return {"ok": True, "projects": db.list_projects()}
+
+
+@app.post("/api/projects/{pid}/sync")
+async def sync_project(pid: str, request: Request):
+    db = scoped(request)
+    try:
+        result = await asyncio.to_thread(projects.sync_project, db, pid, llm.embed_texts)
+    except projects.ProjectEmbedError as e:
+        raise embed_503(e)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.exception("project sync failed: %s", pid)
+        raise HTTPException(500, f"Could not sync project: {e}")
+    return {"ok": True, **result}
+
+
+@app.get("/api/projects/{pid}/files")
+async def project_files(pid: str, request: Request):
+    db = scoped(request)
+    if not db.get_project(pid):
+        raise HTTPException(404, "Project not found")
+    return {"files": db.list_project_files(pid)}
+
+
+@app.get("/api/projects/{pid}/instructions")
+async def get_project_instructions(pid: str, request: Request):
+    db = scoped(request)
+    if not db.get_project(pid):
+        raise HTTPException(404, "Project not found")
+    return {"instruction": db.active_instruction(pid), "versions": db.list_instructions(pid)}
+
+
+@app.put("/api/projects/{pid}/instructions")
+async def put_project_instructions(pid: str, request: Request):
+    db = scoped(request)
+    if not db.get_project(pid):
+        raise HTTPException(404, "Project not found")
+    body = await json_body(request)
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(400, "Instruction text is empty")
+    row = db.add_instruction(pid, content[:20_000], created_by=identity(request).uid)
+    return {"ok": True, "instruction": row}
 
 
 # ---------------- spreadsheets ----------------
@@ -451,9 +653,12 @@ async def upload_sheet(request: Request):
     ext = os.path.splitext(name)[1].lower()
     if ext not in spreadsheet.ALLOWED_KINDS:
         raise HTTPException(400, f"Unsupported file type '{ext}'. Allowed: .csv, .xlsx")
-    data = await up.read()
-    if len(data) > MAX_SHEET_BYTES:
-        raise HTTPException(413, f"File too large (max {MAX_SHEET_BYTES // (1024 * 1024)} MB)")
+    data = await read_upload(up, MAX_SHEET_BYTES)
+    if ext == ".xlsx":
+        try:
+            parsing.check_zip_safety(data)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     os.makedirs(SHEETS_DIR, exist_ok=True)
     row = db.add_sheet(name, ext.lstrip("."), 0, 0)
     path = sheet_filepath(row["id"], ext)
@@ -490,14 +695,18 @@ async def delete_sheet(sid: int, request: Request):
 
 
 @app.get("/api/sheets/{sid}/chart")
-async def sheet_chart(sid: int, request: Request, type: str = "bar", column: str = "", group: str = "", uid: str = ""):
-    # charts are embedded via <img src>, which cannot send auth headers, so the
-    # identity may also arrive as a query param (uid is not a secret — it is the
-    # same stable key the client already holds)
+async def sheet_chart(sid: int, request: Request, type: str = "bar", column: str = "", group: str = "", token: str = ""):
+    # charts are embedded via <img src>, which cannot send auth headers. A
+    # short-lived HMAC token binds the sheet id to its owner; the old `uid`
+    # query parameter let any caller impersonate another workspace.
     user = identity(request)
-    if user.source == "local" and uid:
-        user = auth.User(uid=uid, source="guest" if uid.startswith("guest:") else "clerk", name="")
-    path = sheet_path(sid, user.uid)
+    uid = user.uid
+    if token:
+        signed = signing.verify_chart(token)
+        if not signed or signed.get("sid") != sid:
+            raise HTTPException(403, "Invalid or expired chart link")
+        uid = signed.get("uid") or ""
+    path = sheet_path(sid, uid)
     if not path:
         raise HTTPException(404, "Spreadsheet not found")
     if type not in ("bar", "line", "hist", "box"):
@@ -522,7 +731,7 @@ async def stt(request: Request):
     up = form.get("file")
     if not up or not up.filename:
         raise HTTPException(400, "No audio file received")
-    data = await up.read()
+    data = await read_upload(up, MAX_AUDIO_BYTES)
     if not data:
         raise HTTPException(400, "Empty audio")
     try:
@@ -712,6 +921,7 @@ async def chat(request: Request):
     if not question:
         raise HTTPException(400, "Empty question")
     sid = body.get("session_id") or None
+    project_id = (body.get("project_id") or "").strip() or None
     attachments = ingest.resolve_attachments(DB.for_user(identity(request).uid), body.get("attachments"))
     user = identity(request)
     db = DB.for_user(user.uid)
@@ -734,6 +944,22 @@ async def chat(request: Request):
                 session_id = db.create_session(question[:70] or "New chat")["id"]
                 history = []
 
+            if project_id and not db.get_project(project_id):
+                yield sse_error("Project not found — pick another project and try again.")
+                yield sse({"type": "done", "answer": "", "sources": []})
+                return
+            if project_id:
+                db.set_session_project(session_id, project_id)
+            active_pid = project_id or (db.get_session(session_id) or {}).get("project_id") or ""
+            project_block = ""
+            if active_pid:
+                proj = db.get_project(active_pid)
+                if proj:
+                    project_block = projects.format_project_block(
+                        proj, db.active_instruction(active_pid),
+                        len(db.list_project_files(active_pid)),
+                    )
+
             key = _config.get("groq_key")
             if not key:
                 yield sse_error("No Groq API key configured — open Settings (gear icon, bottom-left) and paste your key.")
@@ -752,6 +978,8 @@ async def chat(request: Request):
                 is_disconnected=lambda: request.is_disconnected(),
                 uid=user.uid,
                 images_enabled=bool(_config.get("images_enabled", True)),
+                project_block=project_block,
+                project_id=active_pid,
             )
             answer, sources = "", []
             saw_done = False

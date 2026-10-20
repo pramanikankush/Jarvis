@@ -18,7 +18,8 @@ verifies, and streams a grounded answer with citations.
 - **Works with any Groq chat model**; voice uses Groq Whisper (STT) + Groq Orpheus (TTS).
 - **Multi-user ready**: optional Clerk authentication with per-user workspace isolation,
   plus a guest mode and a legacy local mode — one database, scoped queries.
-- **161 tests across 16 suites**, all runnable offline.
+- **Offline test suite** (legacy `tests/run_all.py`) plus pytest security,
+  project, and API integration tests — all runnable without network.
 
 The code lives in [`docchat/`](docchat/). [`docchat/README.md`](docchat/README.md) is the
 developer deep-dive (module layout, trade-offs, internals).
@@ -52,6 +53,7 @@ developer deep-dive (module layout, trade-offs, internals).
 |---|---|---|
 | **Text chat** | Streaming answers (SSE), markdown, tool-activity status | FastAPI, vanilla JS |
 | **Document RAG** | Upload PDF/DOCX/PPTX/ODT/RTF/HTML/JSON/TXT/CSV/MD → parse → chunk → embed → hybrid retrieve → cite | pypdf, python-docx, python-pptx, fastembed |
+| **Projects (v1)** | Import a `.zip`/`.tar` source tree → safe extraction → code-aware chunking/embedding → project search and file reading, with versioned instructions | project indexer, hybrid retrieval |
 | **OCR (scans & images)** | Image-only PDFs and screenshots/photos of documents are read via local OCR — no external service | RapidOCR (ONNX), pypdfium2, Pillow |
 | **Attach & analyze (📎)** | Attach a file to any chat message — parsed and indexed instantly, the agent reads it first and answers with citations | shared ingest pipeline (`ragchat/ingest.py`) |
 | **Hybrid retrieval** | Vector cosine **+** FTS5 BM25, fused with **Reciprocal Rank Fusion**, relevance-gated | SQLite FTS5, numpy |
@@ -411,7 +413,8 @@ python -m uvicorn server:app --host 127.0.0.1 --port 8000
 
 ```bash
 cd docchat
-python tests/run_all.py          # all 16 suites (161 tests)
+python -m pytest -q              # security, project, and API integration tests
+python tests/run_all.py          # legacy offline suites
 python tests/test_agent.py       # agent loop with a scripted fake LLM — no network
 ```
 
@@ -440,6 +443,8 @@ docchat/
   render.yaml         Render blueprint (env vars sync:false)
   ragchat/
     agent.py          the agent loop + self-RAG verification + tool handlers
+    projects.py       safe archive import + code-aware project indexing
+    signing.py        short-lived HMAC URLs for chart images
     registry.py       declarative tool registry (prompt + dispatcher derive from it)
     retrieval.py      hybrid retrieval (vector + BM25 + RRF) with fallbacks
     ingest.py         shared upload/attach ingestion (parse → chunk → embed → store)

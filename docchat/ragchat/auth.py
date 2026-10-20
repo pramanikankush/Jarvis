@@ -37,8 +37,45 @@ log = logging.getLogger("jarvis.auth")
 CLERK_PUBLISHABLE_KEY = os.environ.get("CLERK_PUBLISHABLE_KEY", "")
 CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY", "")
 CLERK_FRONTEND_API = os.environ.get("CLERK_FRONTEND_API", "").rstrip("/")
+CLERK_AUDIENCE = os.environ.get("CLERK_AUDIENCE", "").strip()
+CLERK_ISSUER = os.environ.get("CLERK_ISSUER", "").strip()
+CLERK_AUTHORIZED_PARTIES = os.environ.get("CLERK_AUTHORIZED_PARTIES", "").strip()
 
 _GUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+class AuthError(Exception):
+    """Raised when authentication is required and no valid identity is present."""
+
+
+def auth_mode() -> str:
+    """`local` (single-user, explicit) or `required` (hosted, fail closed)."""
+    return (os.environ.get("AUTH_MODE") or "local").strip().lower()
+
+
+def allow_guests() -> bool:
+    raw = (os.environ.get("ALLOW_GUESTS") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def owner_user_id() -> str:
+    return (os.environ.get("OWNER_USER_ID") or "").strip()
+
+
+def _mark_owner(user: "User") -> "User":
+    owner = owner_user_id()
+    if user.source == "local":
+        user.is_owner = True
+    elif owner:
+        user.is_owner = user.uid == owner or (
+            user.source == "clerk" and user.uid == f"clerk:{owner}"
+        )
+    return user
+
+
+def publishable_domain() -> str:
+    """Public wrapper for the Clerk frontend API domain (no secret material)."""
+    return _publishable_domain()
 
 _jwks_client = None
 _jwks_checked_at = 0.0
@@ -49,17 +86,20 @@ class User:
     """A resolved identity. `uid` is the stable per-workspace key used to
     scope every store query; `""` is the local/legacy workspace."""
 
-    __slots__ = ("uid", "source", "name", "email")
+    __slots__ = ("uid", "source", "name", "email", "is_owner")
 
-    def __init__(self, uid: str, source: str, name: str = "", email: str = ""):
+    def __init__(self, uid: str, source: str, name: str = "", email: str = "",
+                 is_owner: bool = False):
         self.uid = uid
         self.source = source  # "clerk" | "guest" | "local"
         self.name = name
         self.email = email
+        self.is_owner = bool(is_owner)
 
     def to_dict(self) -> dict:
         return {"uid": self.uid, "source": self.source,
-                "name": self.name, "email": self.email}
+                "name": self.name, "email": self.email,
+                "is_owner": self.is_owner}
 
 
 def clerk_enabled() -> bool:
@@ -158,11 +198,18 @@ def verify_clerk_token(token: str) -> User | None:
     client = _get_jwks_client()
     if client is not None:
         try:
+            options = {"verify_aud": bool(CLERK_AUDIENCE), "require": ["exp", "sub"]}
+            kwargs = {}
+            if CLERK_AUDIENCE:
+                kwargs["audience"] = CLERK_AUDIENCE
+            if CLERK_ISSUER:
+                kwargs["issuer"] = CLERK_ISSUER
             claims = jwt.decode(
                 token,
                 client.get_signing_key_from_jwt(token).key,
                 algorithms=["RS256"],
-                options={"verify_aud": False},  # audience varies by JWT template
+                options=options,
+                **kwargs,
             )
         except jwt.PyJWTError as e:
             log.info("Clerk JWT verify failed locally: %s", e)
@@ -171,6 +218,10 @@ def verify_clerk_token(token: str) -> User | None:
         if data:
             claims = data.get("session") or data
     if not claims:
+        return None
+    authorized = [p.strip() for p in CLERK_AUTHORIZED_PARTIES.split(",") if p.strip()]
+    if authorized and str(claims.get("azp") or "") not in authorized:
+        log.warning("Clerk token rejected: unauthorized party %r", claims.get("azp"))
         return None
     uid = str(claims.get("sub") or "").strip()
     if not uid:
@@ -183,17 +234,31 @@ def verify_clerk_token(token: str) -> User | None:
     return User(uid=f"clerk:{uid}", source="clerk", name=name or "Clerk user", email=email)
 
 
-def resolve_user(authorization: str = "", guest_id: str = "") -> User:
+def resolve_user(authorization: str = "", guest_id: str = "",
+                 required: bool | None = None) -> User:
     """Resolve identity from request headers. Precedence: clerk > guest > local.
-    Never raises: an unverifiable Clerk token degrades to guest/local with a log."""
+
+    In `AUTH_MODE=required`, a missing/invalid identity raises AuthError instead
+    of silently falling back to the owner's local workspace. In local mode the
+    legacy degrade-to-local behavior is preserved.
+    """
+    if required is None:
+        required = auth_mode() == "required"
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
         if token:
             u = verify_clerk_token(token)
             if u is not None:
-                return u
-            log.info("unverifiable Clerk token -> degrading to guest/local")
+                return _mark_owner(u)
+            log.info("unverifiable Clerk token (required=%s)", required)
+            if required:
+                raise AuthError("Invalid or expired authentication token.")
     gid = (guest_id or "").strip()
     if gid and _GUEST_ID_RE.match(gid):
-        return User(uid=f"guest:{gid}", source="guest", name="Guest")
-    return User(uid="", source="local", name="Local")
+        if allow_guests():
+            return _mark_owner(User(uid=f"guest:{gid}", source="guest", name="Guest"))
+        if required:
+            raise AuthError("Guest access is disabled.")
+    if required:
+        raise AuthError("Authentication required.")
+    return _mark_owner(User(uid="", source="local", name="Local"))

@@ -11,15 +11,36 @@ web_search lives in ragchat.websearch (Tavily primary + DuckDuckGo fallback);
 this module just re-exports it so all tools stay behind one import.
 """
 import ast
+import ipaddress
 import json
 import logging
 import math
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urljoin, urlsplit
 
 log = logging.getLogger("jarvis.tools")
+
+# Secrets must never reach a shell/subprocess or an untrusted script.
+_SECRET_ENV_KEYS = {
+    "GROQ_API_KEY", "TAVILY_API_KEY", "CLERK_SECRET_KEY", "CLERK_PUBLISHABLE_KEY",
+    "APP_ENCRYPTION_KEY", "APP_ENCRYPTION_KEY_OLD", "CHART_SIGNING_KEY",
+    "GITHUB_APP_PRIVATE_KEY", "GITHUB_CLIENT_SECRET", "GITHUB_WEBHOOK_SECRET",
+}
+
+
+def safe_env() -> dict:
+    """A minimal environment for subprocesses: keep PATH/locale, drop secrets."""
+    return {k: v for k, v in os.environ.items() if k not in _SECRET_ENV_KEYS}
+
+
+def sandbox_enabled() -> bool:
+    """The in-process python sandbox is a local-only convenience, never a
+    security boundary. Hosted deployments must use the isolated worker."""
+    return (os.environ.get("AUTH_MODE") or "local").strip().lower() != "required"
 
 # ---------------- calculator (safe AST eval) ----------------
 _MATH_FUNCS = {
@@ -50,7 +71,11 @@ def calculate(expression: str) -> str:
         elif isinstance(node, ast.Attribute):
             return "Error: attribute access not allowed"
         elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
-            # guard against result blow-up (2 ** 100000000 would allocate GBs)
+            # guard against result blow-up (2 ** 100000000 would allocate GBs).
+            # Nested exponents (2 ** (2 ** 10)) are rejected too: the inner
+            # value is not a Constant, so the simple check would miss it.
+            if isinstance(node.right, ast.BinOp):
+                return "Error: nested exponentiation is not allowed"
             if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
                 if abs(node.right.value) > 10000:
                     return "Error: exponent too large"
@@ -61,7 +86,7 @@ def calculate(expression: str) -> str:
         return f"Error: unknown name(s): {', '.join(sorted(names - _MATH_FUNCS))}"
     try:
         result = eval(compile(tree, "<calc>", "eval"), {"__builtins__": {}}, vars(math))
-    except (ZeroDivisionError, ValueError, OverflowError) as e:
+    except (ZeroDivisionError, ValueError, OverflowError, MemoryError) as e:
         return f"Error: {e}"
     if isinstance(result, float):
         result = round(result, 8)
@@ -184,25 +209,83 @@ def extract_url_text(html: str, max_chars: int = 12000) -> str:
     return text.strip()[:max_chars]
 
 
+_MAX_FETCH_BYTES = 2_000_000
+_MAX_REDIRECTS = 5
+
+
+def _assert_public_url(url: str) -> None:
+    """Reject URLs that resolve to localhost, private, link-local, or
+    metadata addresses. Every redirect hop is checked separately."""
+    parts = urlsplit((url or "").strip())
+    if parts.scheme not in ("http", "https"):
+        raise ValueError("URL must start with http:// or https://")
+    if parts.username or parts.password:
+        raise ValueError("URLs with embedded credentials are not allowed")
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("URL has no host")
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        raise ValueError("URL points to a private/internal host")
+    try:
+        infos = socket.getaddrinfo(
+            host, parts.port or (443 if parts.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as e:
+        raise ValueError(f"Could not resolve host '{host}': {e}") from e
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            raise ValueError("URL resolves to a private/internal address")
+
+
 def fetch_url_text(url: str, timeout: float = 15.0) -> str:
     """Fetch a page and return its readable text. Raises ValueError with a
-    clear message on bad input or fetch failure (caller decides fallback)."""
+    clear message on bad input or fetch failure (caller decides fallback).
+
+    SSRF guard: the initial URL and every redirect target must resolve to a
+    public address, and the response body is capped at 2 MB.
+    """
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
         raise ValueError("URL must start with http:// or https://")
     try:
         import httpx
 
-        resp = httpx.get(url, timeout=timeout, follow_redirects=True, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; JarvisAssistant/1.0)",
-        })
-        resp.raise_for_status()
+        current = url
+        for _ in range(_MAX_REDIRECTS + 1):
+            _assert_public_url(current)
+            with httpx.stream("GET", current, timeout=timeout, follow_redirects=False,
+                              headers={"User-Agent": "Mozilla/5.0 (compatible; JarvisAssistant/1.0)"}) as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location")
+                    if not location:
+                        raise ValueError("Redirect response had no Location header")
+                    current = urljoin(current, location)
+                    continue
+                resp.raise_for_status()
+                ctype = resp.headers.get("content-type", "")
+                if ctype and "html" not in ctype and "text" not in ctype and "json" not in ctype:
+                    raise ValueError(
+                        f"Unsupported content type '{ctype.split(';')[0]}' — I can only read web pages."
+                    )
+                chunks, total = [], 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_FETCH_BYTES:
+                        raise ValueError("Page is too large to read (max 2 MB)")
+                    chunks.append(chunk)
+                body = b"".join(chunks)
+                return extract_url_text(body.decode(resp.charset_encoding or "utf-8", "replace"))
+        raise ValueError("Too many redirects")
+    except ValueError:
+        raise
     except Exception as e:
         raise ValueError(f"Could not fetch the page: {e}") from e
-    ctype = resp.headers.get("content-type", "")
-    if ctype and "html" not in ctype and "text" not in ctype and "json" not in ctype:
-        raise ValueError(f"Unsupported content type '{ctype.split(';')[0]}' — I can only read web pages.")
-    return extract_url_text(resp.text)
 
 
 # ---------------- image generation (free, keyless) ----------------
@@ -283,6 +366,9 @@ def run_python(code: str, df_json: dict | None = None, timeout: int = 15) -> str
     `df_json` is a pandas split-format dict ({"columns": [...], "data": [...]})
     exposed to the script as `df`. Returns captured stdout or an error string.
     """
+    if not sandbox_enabled():
+        return ("Error: the local Python sandbox is disabled in hosted mode. "
+                "Use the isolated worker for code execution.")
     if len(code) > 4000:
         return "Error: code too long (max 4000 chars)"
     df_path = "-"
@@ -296,7 +382,7 @@ def run_python(code: str, df_json: dict | None = None, timeout: int = 15) -> str
         proc = subprocess.run(
             [sys.executable, "-c", _SANDBOX_SNIPPET, df_path],
             input=code, capture_output=True, text=True,
-            timeout=timeout, cwd=tempfile.gettempdir(),
+            timeout=timeout, cwd=tempfile.gettempdir(), env=safe_env(),
         )
     except subprocess.TimeoutExpired:
         return "Error: script timed out after %ds" % timeout

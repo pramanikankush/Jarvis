@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "phase-*"]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docchat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Phase 0 security tests
+        run: python -m pytest -q tests/test_phase0_security.py
+      - name: Legacy offline suite
+        run: python tests/run_all.py
+
+  integration:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docchat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Integration tests
+        run: python -m pytest -q -m integration

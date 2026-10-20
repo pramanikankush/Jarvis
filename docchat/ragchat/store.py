@@ -7,7 +7,6 @@ Three search signals live here:
   * keyword: SQLite FTS5 BM25 (see `keyword_search`) — the hybrid partner
   * memory: durable user facts + per-session summary/task (see memory/session_meta)
 """
-import json
 import os
 import re
 import sqlite3
@@ -18,7 +17,9 @@ import uuid
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(ROOT, "data")
+# DOCCHAT_DATA_DIR lets tests, the worker, and container deployments put the
+# database somewhere other than the checkout (e.g. a mounted volume).
+DATA_DIR = os.environ.get("DOCCHAT_DATA_DIR") or os.path.join(ROOT, "data")
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 
 SCHEMA = """
@@ -91,7 +92,53 @@ CREATE TABLE IF NOT EXISTS notes (
     text TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_ref TEXT,
+    default_branch TEXT,
+    status TEXT NOT NULL DEFAULT 'ready',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_instructions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    language TEXT,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    indexed_at TEXT NOT NULL,
+    UNIQUE(project_id, path)
+);
+CREATE TABLE IF NOT EXISTS project_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    start_line INTEGER,
+    end_line INTEGER,
+    text TEXT NOT NULL,
+    emb BLOB NOT NULL,
+    sha256 TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
+CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id);
+CREATE INDEX IF NOT EXISTS idx_project_instructions_project ON project_instructions(project_id, version);
+CREATE INDEX IF NOT EXISTS idx_project_files_project ON project_files(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_chunks_project ON project_chunks(project_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_memory_fact ON memory(fact);
 """
@@ -99,6 +146,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_fact ON memory(fact);
 # FTS5 needs the virtual table + backfill to be created after the plain tables.
 FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(doc_id UNINDEXED, doc_name, page UNINDEXED, text);
+CREATE VIRTUAL TABLE IF NOT EXISTS project_chunks_fts USING fts5(project_id UNINDEXED, path, text);
 """
 
 
@@ -125,8 +173,14 @@ class Store:
     def __init__(self, db_path=DB_PATH):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=5.0)
         self._conn.row_factory = sqlite3.Row
+        # WAL lets the app and the worker share one database without blocking
+        # readers on the job writer. busy_timeout turns lock contention into a
+        # short wait instead of an immediate "database is locked" error.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
         self._conn.executescript(FTS_SCHEMA)
         self._migrate()
@@ -149,28 +203,31 @@ class Store:
     def _migrate(self):
         """In-place schema upgrades for databases created before this version.
         New columns are added via ALTER TABLE; missing tables are handled by
-        SCHEMA's CREATE TABLE IF NOT EXISTS."""
-        try:
-            cols = [r["name"] for r in self._conn.execute("PRAGMA table_info(sessions)").fetchall()]
-            if "pinned" not in cols:
-                self._conn.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
-            for table, col in (("docs", "user_id"), ("sessions", "user_id"),
-                               ("memory", "user_id"), ("sheets", "user_id"),
-                               ("tasks", "user_id"), ("notes", "user_id")):
-                tcols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
-                if col not in tcols:
-                    self._conn.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
-                    )
-            # user_id indexes live here (not in SCHEMA) so old databases get
-            # them only after the column has been added
-            for table in ("docs", "sessions", "memory", "sheets", "tasks", "notes"):
+        SCHEMA's CREATE TABLE IF NOT EXISTS. A failed migration is fatal: a
+        partially upgraded database is worse than a refused start."""
+        cols = [r["name"] for r in self._conn.execute("PRAGMA table_info(sessions)").fetchall()]
+        if "pinned" not in cols:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        for table, col in (("docs", "user_id"), ("sessions", "user_id"),
+                           ("memory", "user_id"), ("sheets", "user_id"),
+                           ("tasks", "user_id"), ("notes", "user_id"),
+                           ("sessions", "project_id"), ("memory", "project_id")):
+            tcols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if col not in tcols:
                 self._conn.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{table}_user ON {table}(user_id)"
+                    f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
                 )
-            self._conn.commit()
-        except sqlite3.Error:
-            pass
+        # user_id indexes live here (not in SCHEMA) so old databases get
+        # them only after the column has been added
+        for table in ("docs", "sessions", "memory", "sheets", "tasks", "notes"):
+            self._conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_user ON {table}(user_id)"
+            )
+        self._conn.execute(
+            "INSERT INTO schema_version(version) "
+            "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version)"
+        )
+        self._conn.commit()
 
     # ---------------- docs ----------------
     def add_doc(self, name: str, size: int, pages_chunks: list[tuple[int | None, str]], embeddings: list[np.ndarray]) -> dict:
@@ -213,13 +270,17 @@ class Store:
             cur = self._conn.execute(
                 "DELETE FROM docs WHERE id=? AND user_id=?", (doc_id, self._uid)
             )
+            if not cur.rowcount:
+                # Do not touch child rows for a document this user does not
+                # own: doc ids are sequential integers and leaking a delete
+                # across workspaces wipes another user's index.
+                self._conn.commit()
+                return False
             self._conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
             self._conn.execute("DELETE FROM chunks_fts WHERE doc_id=?", (doc_id,))
             self._conn.commit()
-            if cur.rowcount:
-                self._shared["version"] += 1
-                return True
-            return False
+            self._shared["version"] += 1
+            return True
 
     # ---------------- FTS5 keyword search ----------------
     def reindex_fts(self) -> None:
@@ -233,7 +294,7 @@ class Store:
                 self._conn.execute("DELETE FROM chunks_fts")
                 self._conn.execute(
                     "INSERT INTO chunks_fts(doc_id, doc_name, page, text) "
-                    "SELECT id, doc_name, page, text FROM chunks"
+                    "SELECT doc_id, doc_name, page, text FROM chunks"
                 )
                 self._conn.commit()
         except sqlite3.Error:
@@ -467,6 +528,206 @@ class Store:
             self._conn.commit()
             return bool(cur.rowcount)
 
+    # ---------------- projects ----------------
+    def create_project(self, name: str, source_type: str, source_ref: str | None = None,
+                       default_branch: str | None = None, status: str = "ready") -> dict:
+        pid = uuid.uuid4().hex
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO projects(id, user_id, name, source_type, source_ref, "
+                "default_branch, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (pid, self._uid, name, source_type, source_ref, default_branch, status, now, now),
+            )
+            self._conn.commit()
+        return self.get_project(pid)
+
+    def get_project(self, pid: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM projects WHERE id=? AND user_id=?", (pid, self._uid)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_projects(self, limit: int = 100) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM projects WHERE user_id=? ORDER BY updated_at DESC LIMIT ?",
+            (self._uid, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_project(self, pid: str, name: str | None = None, status: str | None = None,
+                       source_ref: str | None = None, default_branch: str | None = None) -> dict | None:
+        fields, params = [], []
+        for col, value in (("name", name), ("status", status), ("source_ref", source_ref),
+                           ("default_branch", default_branch)):
+            if value is not None:
+                fields.append(f"{col}=?")
+                params.append(value)
+        if not fields:
+            return self.get_project(pid)
+        fields.append("updated_at=?")
+        params.extend([time.strftime("%Y-%m-%d %H:%M:%S"), pid, self._uid])
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE projects SET {', '.join(fields)} WHERE id=? AND user_id=?", params
+            )
+            self._conn.commit()
+        return self.get_project(pid) if cur.rowcount else None
+
+    def delete_project(self, pid: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM projects WHERE id=? AND user_id=?", (pid, self._uid)
+            )
+            if not cur.rowcount:
+                self._conn.commit()
+                return False
+            for table in ("project_instructions", "project_files", "project_chunks"):
+                self._conn.execute(f"DELETE FROM {table} WHERE project_id=?", (pid,))
+            self._conn.execute("DELETE FROM project_chunks_fts WHERE project_id=?", (pid,))
+            self._conn.commit()
+            return True
+
+    def add_instruction(self, pid: str, content: str, created_by: str = "") -> dict | None:
+        if not self.get_project(pid):
+            return None
+        row = self._conn.execute(
+            "SELECT MAX(version) FROM project_instructions WHERE project_id=?", (pid,)
+        ).fetchone()
+        version = int(row[0] or 0) + 1
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO project_instructions(project_id, version, content, created_by, "
+                "created_at) VALUES(?,?,?,?,?)",
+                (pid, version, content, created_by, now),
+            )
+            self._conn.execute("UPDATE projects SET updated_at=? WHERE id=?", (now, pid))
+            self._conn.commit()
+        return {"id": cur.lastrowid, "project_id": pid, "version": version,
+                "content": content, "created_by": created_by, "created_at": now}
+
+    def active_instruction(self, pid: str) -> dict | None:
+        if not self.get_project(pid):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM project_instructions WHERE project_id=? ORDER BY version DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_instructions(self, pid: str) -> list[dict]:
+        if not self.get_project(pid):
+            return []
+        rows = self._conn.execute(
+            "SELECT * FROM project_instructions WHERE project_id=? ORDER BY version DESC",
+            (pid,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def replace_project_index(self, pid: str, files: list[dict], chunks: list[dict],
+                              embeddings: list[np.ndarray]) -> bool:
+        """Replace the indexed files/chunks for a project. `chunks` is parallel
+        to `embeddings`; each file dict is {path, language, size, sha256}."""
+        if not self.get_project(pid):
+            return False
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            self._conn.execute("DELETE FROM project_files WHERE project_id=?", (pid,))
+            self._conn.execute("DELETE FROM project_chunks WHERE project_id=?", (pid,))
+            self._conn.execute("DELETE FROM project_chunks_fts WHERE project_id=?", (pid,))
+            self._conn.executemany(
+                "INSERT INTO project_files(project_id, path, language, size, sha256, indexed_at) "
+                "VALUES(?,?,?,?,?,?)",
+                [(pid, f["path"], f.get("language"), f["size"], f["sha256"], now) for f in files],
+            )
+            self._conn.executemany(
+                "INSERT INTO project_chunks(project_id, path, start_line, end_line, text, emb, sha256) "
+                "VALUES(?,?,?,?,?,?,?)",
+                [
+                    (pid, c["path"], c.get("start_line"), c.get("end_line"), c["text"],
+                     np.asarray(emb, dtype="<f4").tobytes(), c["sha256"])
+                    for c, emb in zip(chunks, embeddings)
+                ],
+            )
+            self._conn.executemany(
+                "INSERT INTO project_chunks_fts(project_id, path, text) VALUES(?,?,?)",
+                [(pid, c["path"], c["text"]) for c in chunks],
+            )
+            self._conn.execute("UPDATE projects SET updated_at=? WHERE id=?", (now, pid))
+            self._conn.commit()
+        return True
+
+    def list_project_files(self, pid: str) -> list[dict]:
+        if not self.get_project(pid):
+            return []
+        rows = self._conn.execute(
+            "SELECT path, language, size, sha256, indexed_at FROM project_files "
+            "WHERE project_id=? ORDER BY path", (pid,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def project_total_chunks(self, pid: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM project_chunks c JOIN projects p ON p.id=c.project_id "
+            "WHERE c.project_id=? AND p.user_id=?", (pid, self._uid),
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def project_vector_search(self, pid: str, query_vec: np.ndarray, k: int = 8) -> list[dict]:
+        if query_vec is None:
+            return []
+        rows = self._conn.execute(
+            "SELECT c.path, c.start_line, c.end_line, c.text, c.emb FROM project_chunks c "
+            "JOIN projects p ON p.id=c.project_id WHERE c.project_id=? AND p.user_id=?",
+            (pid, self._uid),
+        ).fetchall()
+        if not rows:
+            return []
+        matrix = np.vstack([np.frombuffer(r["emb"], dtype="<f4") for r in rows])
+        if matrix.shape[1] != query_vec.size:
+            return []
+        scores = matrix @ query_vec
+        top = np.argsort(-scores)[:k]
+        return [
+            {"path": rows[i]["path"], "start_line": rows[i]["start_line"],
+             "end_line": rows[i]["end_line"], "text": rows[i]["text"],
+             "score": float(scores[i])}
+            for i in top
+        ]
+
+    def project_keyword_search(self, pid: str, query: str, k: int = 8) -> list[dict]:
+        match = fts_query(query)
+        if not match:
+            return []
+        try:
+            rows = self._conn.execute(
+                "SELECT f.path, f.text, c.start_line, c.end_line, bm25(project_chunks_fts) AS bm25 "
+                "FROM project_chunks_fts f "
+                "JOIN project_chunks c ON c.project_id=f.project_id AND c.path=f.path AND c.text=f.text "
+                "JOIN projects p ON p.id = f.project_id "
+                "WHERE project_chunks_fts MATCH ? AND f.project_id=? AND p.user_id=? "
+                "ORDER BY bm25 LIMIT ?",
+                (match, pid, self._uid, k),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        return [{"path": r["path"], "text": r["text"], "start_line": r["start_line"],
+                 "end_line": r["end_line"], "bm25": float(r["bm25"])}
+                for r in rows]
+
+    def set_session_project(self, sid: str, pid: str | None) -> bool:
+        pid = pid or ""
+        if pid and not self.get_project(pid):
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE sessions SET project_id=?, updated_at=? WHERE id=? AND user_id=?",
+                (pid, time.strftime("%Y-%m-%d %H:%M:%S"), sid, self._uid),
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
+
     # ---------------- sessions/messages ----------------
     def create_session(self, title: str) -> dict:
         sid = uuid.uuid4().hex
@@ -477,7 +738,8 @@ class Store:
                 (sid, self._uid, title, now, now),
             )
             self._conn.commit()
-        return {"id": sid, "title": title, "created_at": now, "updated_at": now, "pinned": 0}
+        return {"id": sid, "title": title, "created_at": now, "updated_at": now,
+                "pinned": 0, "project_id": ""}
 
     def set_title(self, sid: str, title: str):
         with self._lock:
@@ -505,7 +767,7 @@ class Store:
             return self.list_sessions(limit)
         like = f"%{q}%"
         rows = self._conn.execute(
-            "SELECT s.id, s.title, s.updated_at, s.pinned, "
+            "SELECT s.id, s.title, s.updated_at, s.pinned, s.project_id, "
             "(SELECT content FROM messages m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) AS last "
             "FROM sessions s WHERE s.title LIKE ? COLLATE NOCASE AND s.user_id = ? "
             "ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?",
@@ -515,7 +777,7 @@ class Store:
 
     def list_sessions(self, limit: int = 100) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT s.id, s.title, s.updated_at, s.pinned, "
+            "SELECT s.id, s.title, s.updated_at, s.pinned, s.project_id, "
             "(SELECT content FROM messages m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) AS last "
             "FROM sessions s WHERE s.user_id = ? ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?",
             (self._uid, limit),
@@ -585,9 +847,12 @@ class Store:
             cur = self._conn.execute(
                 "DELETE FROM sessions WHERE id=? AND user_id=?", (sid, self._uid)
             )
+            if not cur.rowcount:
+                self._conn.commit()
+                return False
             self._conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
             self._conn.commit()
-            return bool(cur.rowcount)
+            return True
 
     # ---------------- search ----------------
     def close(self):

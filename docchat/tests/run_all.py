@@ -2,14 +2,17 @@
 import importlib
 import os
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+# Never let a test suite write into the developer's real data/app.db.
+os.environ.setdefault("DOCCHAT_DATA_DIR", tempfile.mkdtemp(prefix="jarvis-tests-"))
 
 MODULES = ["test_check", "test_envfile", "test_retrieval", "test_tools", "test_spreadsheet",
            "test_memory", "test_websearch", "test_usagetrack", "test_agent", "test_auth",
            "test_demo_limit", "test_planner", "test_toolkit", "test_migration", "test_attach",
-           "test_formats"]
+           "test_formats", "test_projects"]
 
 
 def main():

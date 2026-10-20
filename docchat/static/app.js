@@ -11,6 +11,8 @@ const emptyEl = $("#empty-state");
 const state = {
   docs: [],
   sheets: [],
+  projects: [],
+  project: null,   // active project id for the next chat turn
   sessions: [],
   memory: [],
   tasks: [],
@@ -79,6 +81,11 @@ async function api(url, opts = {}) {
   const res = await fetch(url, { ...opts, headers });
   let data = {};
   try { data = await res.json(); } catch (_) {}
+  if (res.status === 401) {
+    const err = new Error(data.detail || "Sign in required");
+    err.code = "unauthorized";
+    throw err;
+  }
   if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
   return data;
 }
@@ -392,6 +399,122 @@ async function addNoteFromInput() {
   } catch (err) { toast(err.message, "err"); }
 }
 
+/* ---------------- projects sidebar ---------------- */
+function renderProjectChip() {
+  const chip = $("#project-chip");
+  if (!chip) return;
+  const project = state.projects.find((p) => p.id === state.project);
+  if (!project) {
+    chip.classList.add("hidden");
+    chip.replaceChildren();
+    return;
+  }
+  chip.classList.remove("hidden");
+  const label = document.createElement("span");
+  label.textContent = `Project: ${project.name}`;
+  const clear = document.createElement("button");
+  clear.className = "project-clear";
+  clear.textContent = "✕";
+  clear.title = "Clear project";
+  clear.onclick = () => selectProject(null);
+  chip.replaceChildren(label, clear);
+}
+
+function renderProjects() {
+  const list = $("#projects-list");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!state.projects.length) {
+    list.innerHTML = '<li class="doc-item muted-note">No projects — import a .zip archive.</li>';
+    renderProjectChip();
+    return;
+  }
+  for (const p of state.projects) {
+    const li = document.createElement("li");
+    li.className = "doc-item" + (p.id === state.project ? " active" : "");
+    li.role = "button";
+    li.tabIndex = 0;
+    const icon = document.createElement("span");
+    icon.className = "doc-icon";
+    icon.innerHTML = "<svg width=\"14\" height=\"14\" viewBox=\"0 0 14 14\" fill=\"none\" aria-hidden=\"true\"><path d=\"M1.5 3.5h4l1.3 1.6h5.7v7.4H1.5z\" stroke=\"currentColor\" stroke-width=\"1.2\" stroke-linejoin=\"round\"/><path d=\"M1.5 5.1h11\" stroke=\"currentColor\" stroke-width=\"1.1\"/></svg>";
+    const main = document.createElement("div");
+    main.className = "doc-main";
+    const nm = document.createElement("div");
+    nm.className = "doc-name";
+    nm.textContent = p.name;
+    nm.title = p.name;
+    const meta = document.createElement("div");
+    meta.className = "doc-meta project-status" + (p.status === "error" ? " error" : "");
+    meta.textContent = p.status === "ready" ? "Ready" : p.status;
+    main.append(nm, meta);
+    const del = document.createElement("button");
+    del.className = "doc-del";
+    del.textContent = "✕";
+    del.title = "Delete project";
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete project "${p.name}" and its index?`)) return;
+      try {
+        await api(`/api/projects/${p.id}`, { method: "DELETE" });
+        state.projects = state.projects.filter((x) => x.id !== p.id);
+        if (state.project === p.id) state.project = null;
+        renderProjects();
+        renderProjectChip();
+        toast("Project deleted.", "ok");
+      } catch (err) { toast(err.message, "err"); }
+    };
+    li.append(icon, main, del);
+    li.onclick = () => selectProject(p.id);
+    li.onkeydown = (e) => { if (e.key === "Enter") selectProject(p.id); };
+    list.appendChild(li);
+  }
+  renderProjectChip();
+}
+
+async function loadProjects() {
+  state.projects = (await api("/api/projects")).projects || [];
+  renderProjects();
+}
+
+function selectProject(pid) {
+  state.project = pid || null;
+  if (state.current) {
+    // A project switch starts a fresh conversation; the demo cap is enforced
+    // server-side when the first message creates a session.
+    state.current = null;
+    $("#chat").innerHTML = "";
+    emptyEl.classList.remove("hidden");
+  }
+  renderProjects();
+  renderProjectChip();
+  renderSessions();
+  inputEl.focus();
+}
+
+async function uploadProject(file) {
+  const status = $("#project-status");
+  status.classList.remove("hidden");
+  status.textContent = `Indexing ${file.name}…`;
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("name", file.name.replace(/\.(zip|tar|tar\.gz|tgz)$/i, ""));
+  try {
+    const headers = await authHeaders();
+    const res = await fetch("/api/projects", { method: "POST", headers, body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    state.projects = data.projects || [];
+    selectProject(data.project.id);
+    toast(`Project ready: ${data.project.name} (${data.stats.files} files, ${data.stats.chunks} chunks)`, "ok");
+  } catch (err) {
+    toast(err.message, "err");
+  } finally {
+    status.classList.add("hidden");
+    status.textContent = "";
+    $("#project-input").value = "";
+  }
+}
+
 /* ---------------- sessions sidebar ---------------- */
 function relTime(ts) {
   const diff = (Date.now() - new Date(ts.replace(" ", "T") + "Z")) / 1000;
@@ -515,11 +638,15 @@ function newChat() {
   $("#chat").innerHTML = "";
   emptyEl.classList.remove("hidden");
   renderSessions();
+  renderProjectChip();
   inputEl.focus();
 }
 
 async function openSession(id) {
   state.current = id;
+  const session = state.sessions.find((s) => s.id === id);
+  state.project = (session && session.project_id) || null;
+  renderProjects();
   emptyEl.classList.add("hidden");
   const data = await api(`/api/sessions/${id}/messages`);
   const chat = $("#chat");
@@ -717,9 +844,16 @@ async function sendMessage(text, attachments = []) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers,
-      body: JSON.stringify({ session_id: state.current, message: text, attachments }),
+      body: JSON.stringify({ session_id: state.current, message: text, attachments,
+                             project_id: state.project }),
       signal: state.abort.signal,
     });
+    if (res.status === 401) {
+      gotError = true;
+      setAssistantError(assistantMsg, "Please sign in to continue.");
+      toast("Please sign in to continue.", "err");
+      return;
+    }
     if (!res.ok || !res.body) {
       let detail = `HTTP ${res.status}`;
       try { detail = (await res.json()).detail || detail; } catch (_) {}
@@ -1132,6 +1266,13 @@ function setIdentityUI(me, enabled) {
     identityBtn.title = "Sign in";
     identityBtn.classList.remove("hidden");
     accountBtn.classList.add("hidden");
+  } else if (me.source === "required") {
+    identityAvatar.classList.add("hidden");
+    identityMeta.textContent = "Sign in required";
+    identityBtn.textContent = enabled ? "Sign in" : "";
+    identityBtn.title = "Sign in";
+    identityBtn.classList.toggle("hidden", !enabled);
+    accountBtn.classList.add("hidden");
   } else {
     identityAvatar.classList.add("hidden");
     identityMeta.textContent = "Local workspace";
@@ -1296,9 +1437,23 @@ if (Number.isFinite(_savedW)) setSidebarWidth(_savedW);
 /* ---------------- init ---------------- */
 async function init() {
   const st = await api("/api/state");
+  if (st.auth_required && !st.me) {
+    // Hosted mode without a session: render the sign-in affordance and stop
+    // before touching any user-scoped data (the public state has none).
+    state.docs = []; state.sessions = []; state.sheets = []; state.projects = [];
+    renderDocs(); renderSheets(); renderProjects(); renderSessions(); updateStat();
+    setIdentityUI({ source: "required" }, !!st.clerk_enabled);
+    if (st.clerk_pk) window.__CLERK_PK__ = st.clerk_pk;
+    if (st.clerk_domain) window.__CLERK_DOMAIN__ = st.clerk_domain;
+    $("#key-banner").classList.add("hidden");
+    toast("Sign in to use this workspace.", "err");
+    if (st.clerk_enabled) initClerk().catch(() => {});
+    return;
+  }
   state.docs = st.docs;
   state.sessions = st.sessions;
   state.sheets = st.sheets;
+  state.projects = st.projects || [];
   state.keySet = st.key_set;
   state.tavilySet = !!st.tavily_set;
   state.model = st.model;
@@ -1307,6 +1462,7 @@ async function init() {
   setDemoChats(st.demo_max_chats);
   renderDocs();
   renderSheets();
+  renderProjects();
   renderSessions();
   updateStat();
   renderQuota(st.usage || null);
@@ -1420,6 +1576,13 @@ $("#file-input").addEventListener("change", (e) => {
 ["dragleave", "drop"].forEach((ev) =>
   dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.remove("drag"); }));
 dropzone.addEventListener("drop", (e) => uploadFiles([...e.dataTransfer.files]));
+
+// project import
+$("#btn-add-project").addEventListener("click", () => $("#project-input").click());
+$("#project-input").addEventListener("change", (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (file) uploadProject(file);
+});
 
 // sheet upload
 $("#btn-add-sheet").addEventListener("click", () => $("#sheet-input").click());

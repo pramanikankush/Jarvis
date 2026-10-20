@@ -11,6 +11,7 @@ import io
 import logging
 import os
 import re
+import zipfile
 
 from docx import Document as _Docx
 from docx.oxml.ns import qn
@@ -29,6 +30,38 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 MAX_FILE_CHARS = 300_000
 MAX_ROW_TEXT = 150_000
 MIN_PDF_PAGE_CHARS = 20
+MAX_ARCHIVE_UNCOMPRESSED = 200 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 10_000
+
+
+def check_zip_safety(data: bytes, max_uncompressed: int = MAX_ARCHIVE_UNCOMPRESSED) -> bool:
+    """Reject zip bombs before handing a container format to a parser.
+
+    Returns False for a non-zip payload (the format-specific parser produces
+    the better error message); raises ValueError when the declared uncompressed
+    size or member count exceeds the cap.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            infos = z.infolist()
+    except (zipfile.BadZipFile, OSError):
+        return False
+    if len(infos) > MAX_ARCHIVE_MEMBERS:
+        raise ValueError(
+            f"Archive contains too many files ({len(infos)}; max {MAX_ARCHIVE_MEMBERS})."
+        )
+    total = sum(max(0, i.file_size) for i in infos)
+    if total > max_uncompressed:
+        raise ValueError(
+            f"Archive expands to {total // (1024 * 1024)} MB (max "
+            f"{max_uncompressed // (1024 * 1024)} MB)."
+        )
+    for info in infos:
+        if info.file_size > max_uncompressed:
+            raise ValueError(
+                f"Archive member '{info.filename}' is too large to extract safely."
+            )
+    return True
 
 
 def decode_text(data: bytes) -> str:
@@ -45,6 +78,8 @@ def parse(name: str, data: bytes) -> list[tuple[int | None, str]]:
     ext = os.path.splitext(name)[1].lower()
     if ext not in SUPPORTED_EXT:
         raise ValueError(f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(SUPPORTED_EXT))}")
+    if ext in (".docx", ".pptx", ".odt"):
+        check_zip_safety(data)
     if ext == ".pdf":
         return _parse_pdf(data)
     if ext == ".docx":

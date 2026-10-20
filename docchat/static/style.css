@@ -134,6 +134,23 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .mini-btn:hover { color: var(--on-dark); border-color: rgba(250, 249, 245, 0.5); }
 
+.doc-item.active {
+  background: var(--surface-dark-elevated);
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+.project-status.error { color: #ffb4a8; }
+.project-chip {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 6px; padding: 5px 9px; border-radius: var(--radius-md);
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  color: var(--ink); font-size: 12px;
+}
+.project-chip .project-clear {
+  background: none; border: none; color: var(--muted); font-size: 12px;
+  padding: 0 2px; cursor: pointer;
+}
+.project-chip .project-clear:hover { color: var(--error); }
+
 /* sidebar inputs: chat search + memory add */
 .chat-search, .mem-input {
   width: 100%; background: var(--surface-dark-elevated); color: var(--on-dark);

@@ -24,5 +24,6 @@ docchat/server_err.log
 .DS_Store
 Thumbs.db
 
-# ---------- tool state (Freebuff) ----------
+# ---------- tool state ----------
 .freebuff/
+.commandcode/

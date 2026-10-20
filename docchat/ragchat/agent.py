@@ -35,6 +35,8 @@ SYSTEM_TPL = """You are Jarvis, a personal AI assistant in the style of Iron Man
 
 {memory_block}
 
+{project_block}
+
 AVAILABLE TOOLS — choose at most one per step; respond with ONLY a JSON object:
 {{
   "thought": "short reasoning",
@@ -45,6 +47,8 @@ AVAILABLE TOOLS — choose at most one per step; respond with ONLY a JSON object
 
 - ATTACHED FILES: {attachments}
 - search_documents: {search_documents}
+- project_search: {project_search}
+- read_project_file: {read_project_file}
 - calculate: {calculate}
 - web_search: {web_search}
 - analyze_spreadsheet: {analyze_spreadsheet}
@@ -63,6 +67,10 @@ message — they want these files read and analyzed. Call search_documents FIRST
 topical to the files and the question) before answering, and cite the results. If the
 question is only a greeting/small talk, acknowledge the files briefly and say what you
 can do with them instead of searching.
+
+PROJECTS: when PROJECT CONTEXT is present, use project_search to find code and
+read_project_file to inspect a specific file. Cite paths. Never claim to have run
+tests or changed files unless a tool result says so.
 
 PLANNING:
 - For anything that needs more than one quick action (multi-part questions, coding tasks, planning requests like "plan my day" or "help me build X", comparisons), include "plan": an array of 2-5 short steps you intend to take, in order.
@@ -86,6 +94,8 @@ FINAL_RAG_TPL = """You are Jarvis, a personal AI assistant.
 
 {memory_block}
 
+{project_block}
+
 TOOL ACTIVITY THIS TURN (results from tools you chose):
 {tool_log}
 
@@ -98,7 +108,9 @@ Answer the user's question using the tool results above. RULES:
 
 PLAIN_TPL = """You are Jarvis, a personal AI assistant. Help the user with questions, their uploaded documents, spreadsheets, calculations, and web lookups. Be concise and direct.
 
-{memory_block}"""
+{memory_block}
+
+{project_block}"""
 
 VERIFY_PROMPT = """You verify an assistant answer against retrieved sources.
 
@@ -140,6 +152,8 @@ class Agent:
         is_disconnected=None,
         uid: str = "",
         images_enabled: bool = True,
+        project_block: str = "",
+        project_id: str = "",
     ):
         self.key = key
         self.model = model
@@ -150,6 +164,8 @@ class Agent:
         self.get_sheet_path = get_sheet_path or (lambda _sid: None)
         self.is_disconnected = is_disconnected or (lambda: False)
         self.uid = uid  # identity for chart/image URLs (fetched via <img>, no headers)
+        self.project_block = project_block or ""
+        self.project_id = project_id or ""
         self._last_sources: list[dict] = []
         self._chart_event: dict | None = None
         self._web_cache: dict[str, str] = {}  # per-turn dedup of web queries
@@ -210,7 +226,8 @@ class Agent:
             steps += 1
             if await self._check_disconnect():
                 return
-            decision = await self._decide(question, history, mem_block, tool_log, attachments_ctx)
+            decision = await self._decide(question, history, mem_block, tool_log,
+                                          attachments_ctx, self.project_block)
             if decision is None:
                 break  # model output unparseable -> answer with what we have
             new_plan = decision.get("plan")
@@ -279,10 +296,11 @@ class Agent:
 
     # ---------------- decision step ----------------
     async def _decide(self, question, history, mem_block, tool_log,
-                      attachments_ctx: str = "") -> dict | None:
+                      attachments_ctx: str = "", project_block: str = "") -> dict | None:
         messages = self._messages(
             SYSTEM_TPL.format(memory_block=mem_block, attachments=attachments_ctx,
-                              **TOOL_DOCS), history, question, tool_log)
+                              project_block=project_block, **TOOL_DOCS),
+            history, question, tool_log)
         try:
             raw = await self.llm_chat(self.key, self.model, messages, json_mode=True,
                                       temperature=0.1, max_tokens=600)
@@ -379,6 +397,80 @@ class Agent:
         joined = " ".join(h["text"].lower() for h in hits[:4])
         covered = sum(1 for t in tokens if t in joined)
         return (covered / len(tokens)) < 0.4 or str(meta.get("fallback") or "").startswith("vector only")
+
+    @registry.register(
+        "project_search",
+        "Search the active project's source code. Use this FIRST for questions about the "
+        "project's code. Args: {\"query\": str, \"k\": int (default 6)}",
+        category="project",
+    )
+    async def _tool_project_search(self, args: dict):
+        if not self.project_id:
+            return "Error: no project is attached to this chat. Ask the user to select a project."
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return "Error: empty search query."
+        k = min(max(int(args.get("k") or RAG_K), 1), 10)
+        vector_hits: list[dict] = []
+        keyword_hits: list[dict] = []
+        if self.embed_fn is not None:
+            try:
+                q_vec = await asyncio.to_thread(self.embed_fn, query)
+                vector_hits = await asyncio.to_thread(
+                    self.store.project_vector_search, self.project_id, q_vec, k)
+            except Exception as e:
+                log.warning("project vector search failed: %s", e)
+        try:
+            keyword_hits = await asyncio.to_thread(
+                self.store.project_keyword_search, self.project_id, query, k)
+        except Exception as e:
+            log.warning("project keyword search failed: %s", e)
+        hits = self._fuse_project_hits(vector_hits, keyword_hits, k)
+        if not hits:
+            return "No matching project code found for that query. Tell the user what you searched for."
+        lines = []
+        for i, hit in enumerate(hits, 1):
+            loc = str(hit.get("path") or "")
+            if hit.get("start_line"):
+                loc += f":{hit['start_line']}-{hit.get('end_line') or hit['start_line']}"
+            lines.append(f"[{i}] {loc}\n{hit.get('text', '')[:900]}")
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _fuse_project_hits(vector_hits: list[dict], keyword_hits: list[dict], k: int) -> list[dict]:
+        scores: dict[tuple, dict] = {}
+        for rank, hit in enumerate(vector_hits):
+            key = (hit.get("path"), hit.get("start_line"), hit.get("text", "")[:120])
+            item = scores.setdefault(key, dict(hit))
+            item["rrf"] = item.get("rrf", 0.0) + 1.0 / (retrieval.RRF_K + rank + 1)
+        for rank, hit in enumerate(keyword_hits):
+            key = (hit.get("path"), hit.get("start_line"), hit.get("text", "")[:120])
+            item = scores.setdefault(key, dict(hit))
+            item["rrf"] = item.get("rrf", 0.0) + 1.0 / (retrieval.RRF_K + rank + 1)
+        return sorted(scores.values(), key=lambda x: -x["rrf"])[:k]
+
+    @registry.register(
+        "read_project_file",
+        "Read a file from the active project. Args: {\"path\": str, \"start_line\": int?, "
+        "\"end_line\": int?}. Use project_search first to find the right path.",
+        category="project",
+    )
+    async def _tool_read_project_file(self, args: dict):
+        if not self.project_id:
+            return "Error: no project is attached to this chat. Ask the user to select a project."
+        path = str(args.get("path") or "").strip()
+        if not path:
+            return "Error: empty file path."
+        from . import projects as projects_mod
+
+        try:
+            text = await asyncio.to_thread(
+                projects_mod.read_project_file, self.store, self.project_id, path,
+                args.get("start_line"), args.get("end_line"),
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+        return text or "(file is empty)"
 
     @registry.register(
         "calculate",
@@ -481,7 +573,7 @@ class Agent:
                 lines = "\n".join(f"[{f['id']}] ({f['kind']}) {f['fact']}" for f in matches)
                 return f"Multiple facts match — call op='update' with one id:\n{lines}"
             ok = self.store.update_memory(matches[0]["id"], fact, kind or None)
-            return f"Updated memory {matches[0]['id']}: {fact}" if ok else f"Error: could not update."
+            return f"Updated memory {matches[0]['id']}: {fact}" if ok else "Error: could not update."
         if op in ("forget", "delete"):
             if op == "delete":
                 try:
@@ -729,10 +821,15 @@ class Agent:
                 return f"Error: column '{column}' not found. Columns: {', '.join(map(str, df.columns))}"
             # validate the chart renders before promising a URL
             await asyncio.to_thread(spreadsheet.chart, df, chart_type, column, group)
-            url = f"/api/sheets/{sid}/chart?type={chart_type}&column={column}&group={group or ''}"
+            from urllib.parse import quote
+
+            from . import signing
+
+            url = (f"/api/sheets/{sid}/chart?type={quote(chart_type)}"
+                   f"&column={quote(column)}&group={quote(group or '')}")
             if self.uid:
-                # chart is fetched via <img> (no auth headers) -> identity in the URL
-                url += f"&uid={self.uid}"
+                # <img> cannot send auth headers -> short-lived signed token
+                url += f"&token={quote(signing.sign_chart(sid, self.uid))}"
             self._chart_event = {"type": "chart", "url": url}
             return f"Chart ready: {url}"
         return f"Error: unknown op '{op}' (info|stats|groupby|filter|anomalies|chart)."
@@ -776,7 +873,7 @@ class Agent:
         yield {"type": "status", "label": "Reranking results…"}
         yield {"type": "status", "label": "Verifying sources…"}
         messages = self._messages(
-            FINAL_RAG_TPL.format(memory_block=mem_block,
+            FINAL_RAG_TPL.format(memory_block=mem_block, project_block=self.project_block,
                                  tool_log=self._format_tool_log(tool_log)), history, question, [])
         # pin the sources explicitly so generation is grounded regardless of tool log
         messages[-1] = {"role": "user", "content":
@@ -796,7 +893,8 @@ class Agent:
     async def _answer_with_tools(self, question, history, mem_block, tool_log):
         yield {"type": "status", "label": "Composing answer…"}
         messages = self._messages(
-            FINAL_RAG_TPL.format(memory_block=mem_block, tool_log=self._format_tool_log(tool_log)),
+            FINAL_RAG_TPL.format(memory_block=mem_block, project_block=self.project_block,
+                                 tool_log=self._format_tool_log(tool_log)),
             history, question, [])
         try:
             answer = await self.llm_chat(self.key, self.model, messages, temperature=0.2,
@@ -810,7 +908,9 @@ class Agent:
         yield {"type": "done", "answer": answer, "sources": []}
 
     async def _stream_plain(self, question, history, mem_block):
-        messages = self._messages(PLAIN_TPL.format(memory_block=mem_block), history, question, [])
+        messages = self._messages(
+            PLAIN_TPL.format(memory_block=mem_block, project_block=self.project_block),
+            history, question, [])
         try:
             async for delta in self.llm_stream(self.key, self.model, messages):
                 if await self._check_disconnect():

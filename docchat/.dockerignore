@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+data/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+.gitignore
+*.log
+server_*.log
+claude/
+DESIGN.md
+README.md

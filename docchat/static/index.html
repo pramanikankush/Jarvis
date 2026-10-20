@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/style.css?v=2">
+<link rel="stylesheet" href="/style.css?v=3">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23cc785c'/><path d='M50 22v56M22 50h56' stroke='%23faf9f5' stroke-width='10' stroke-linecap='round'/><path d='M33 33l34 34M67 33L33 67' stroke='%23faf9f5' stroke-width='7' stroke-linecap='round' opacity='.6'/></svg>">
 </head>
 <body>
@@ -35,6 +35,16 @@
                accept=".pdf,.docx,.pptx,.odt,.rtf,.html,.htm,.json,.txt,.md,.markdown,.csv,.log,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff">
         <div id="indexing-note" class="indexing-note hidden"></div>
         <ul id="docs-list" class="docs-list"></ul>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <span>Projects</span>
+          <button id="btn-add-project" class="mini-btn" title="Import a project archive">＋</button>
+        </div>
+        <input type="file" id="project-input" hidden accept=".zip,.tar,.tar.gz,.tgz">
+        <div id="project-status" class="indexing-note hidden"></div>
+        <ul id="projects-list" class="docs-list"></ul>
       </section>
 
       <section>
@@ -160,6 +170,7 @@
     </div>
 
     <div id="composer" class="composer">
+      <div id="project-chip" class="project-chip hidden"></div>
       <div id="attach-chips" class="attach-chips hidden"></div>
       <div class="composer-box">
         <button id="btn-attach" class="mic-btn attach-btn" title="Attach a document — it is analyzed with your next message"
@@ -256,6 +267,6 @@
 
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
-<script src="/app.js?v=5"></script>
+<script src="/app.js?v=6"></script>
 </body>
 </html>

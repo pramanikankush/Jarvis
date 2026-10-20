@@ -46,34 +46,25 @@ def test_real_environment_wins_over_file():
 
 
 def test_default_path_points_at_project_root():
-    """load_env() with no args must find .env next to envfile.py — and must
-    never clobber a real user .env: the original content is restored."""
+    """load_env() with no args must use ENV_PATH; point that at a temp file so
+    the test never writes the developer's real .env."""
     import envfile as env_module
 
     real_path = env_module.ENV_PATH
-    had_file = os.path.exists(real_path)
-    original = None
-    if had_file:
-        with open(real_path, encoding="utf-8") as f:
-            original = f.read()
     key = "GROQ_FALLBACK_MODEL"
     saved = os.environ.pop(key, None)
     try:
-        with open(real_path, "w", encoding="utf-8") as f:
-            f.write(f"{key}=llama-3.1-8b-instant\n")
-        assert env_module.load_env() is True
-        assert os.environ[key] == "llama-3.1-8b-instant"
+        with tempfile.TemporaryDirectory() as td:
+            temp_path = os.path.join(td, ".env")
+            _write(temp_path, f"{key}=llama-3.1-8b-instant\n")
+            env_module.ENV_PATH = temp_path
+            assert env_module.load_env() is True
+            assert os.environ[key] == "llama-3.1-8b-instant"
     finally:
+        env_module.ENV_PATH = real_path
         os.environ.pop(key, None)
         if saved is not None:
             os.environ[key] = saved
-        if original is not None:
-            with open(real_path, "w", encoding="utf-8") as f:
-                f.write(original)
-        elif had_file:
-            pass  # keep the original file intact
-        else:
-            os.unlink(real_path)
 
 
 def test_missing_file_and_malformed_lines():

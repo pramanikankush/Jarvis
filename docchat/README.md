@@ -9,7 +9,8 @@ A single-agent personal assistant that answers from **your documents (RAG)**, an
 > chat attachments (📎) — attach a file to any message and the agent reads it first —
 > and a full document parser: PPTX/ODT/RTF/HTML/JSON/LOG plus OCR for scanned PDFs
 > and image files (RapidOCR, fully local).
-> Test suite: 16 modules / 161 tests, all offline.
+> Test suite: the legacy offline modules plus pytest security, project, and
+> API integration tests.
 
 - **100% local** except the Groq API (your key): embeddings and storage run on this machine.
 - One agent loop, no multi-agent machinery, no microservices.
@@ -27,6 +28,7 @@ A single-agent personal assistant that answers from **your documents (RAG)**, an
 | OCR | Scanned/image-only PDFs and screenshots are read with local RapidOCR (models bundled in the wheel; no runtime download, capped at 30 pages) |
 | Hybrid search | Vector cosine + SQLite FTS5 BM25, fused with **Reciprocal Rank Fusion** |
 | Agentic RAG | The agent decides *whether* to search, rewrites queries, searches again if needed; low-confidence document matches carry a deterministic signal that steers the model to web search |
+| Projects (v1) | Import a `.zip`/`.tar` source tree; it is safely extracted and indexed (secrets and binaries skipped), then the project-aware tools (`project_search`, `read_project_file`) answer with file/line context. Versioned project instructions are injected into every project chat. |
 | Chat attachments (📎) | Attach PDF/DOCX/TXT/MD/CSV to any message — parsed and indexed via the shared ingest pipeline, announced in the decision prompt, so the agent searches the attachment first and cites it |
 | Self-RAG | Verifies: sources relevant? answer cites them? answer supported? → corrects once, bounded |
 | Spreadsheet | .csv / .xlsx via pandas: columns, stats, groupby, filters, anomaly detection, charts |
@@ -79,6 +81,12 @@ be exported in your shell.
 | `DOCCHAT_WARM_EMBEDDINGS` | auto | Load the embedding model at startup; `1` forces, `0` skips |
 | `DOCCHAT_WARM_MIN_MB` | `700` | Free memory required to auto-warm (small hosts skip it) |
 | `PORT` | 8000 | Server port |
+| `DOCCHAT_DATA_DIR` | `docchat/data` | Database/config/sheet/project storage root (tests and mounted volumes) |
+| `AUTH_MODE` | `local` | `local` = single-user workspace; `required` = reject missing/invalid credentials with 401 |
+| `ALLOW_GUESTS` | `1` | Allow client-held guest workspaces in `required` mode |
+| `OWNER_USER_ID` | — | Account allowed to change global config in `required` mode (`clerk:user_...`) |
+| `CLERK_AUDIENCE` / `CLERK_ISSUER` / `CLERK_AUTHORIZED_PARTIES` | — | Optional stricter Clerk JWT validation |
+| `CHART_SIGNING_KEY` | random per process | HMAC key for short-lived chart URLs |
 
 ## Architecture
 
@@ -142,6 +150,8 @@ app.py            launcher (port + browser open)
 server.py         FastAPI: agent chat (SSE), docs, sheets, voice, memory, config
 ragchat/
   agent.py        the agent loop + self-RAG verification + tool handlers
+  projects.py     safe archive import + code-aware project indexing
+  signing.py      short-lived HMAC URLs for chart images
   registry.py     declarative tool registry (tool list + dispatcher derive from it)
   retrieval.py    hybrid retrieval (vector + BM25 + RRF) with fallbacks
   ingest.py       shared upload/attach ingestion (parse → chunk → embed → store)
@@ -162,7 +172,9 @@ tests/            per-module suites + run_all.py
 ## Tests
 
 ```bash
-python tests/run_all.py          # all suites
+python -m pytest -q              # security/project/API suites (pytest)
+python -m pytest -m integration  # HTTP-level tests only
+python tests/run_all.py          # legacy offline suites
 python tests/test_agent.py       # agent loop with a scripted fake LLM (no network)
 ```
 
